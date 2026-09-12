@@ -735,6 +735,35 @@ impl WorkspaceSet {
         self.workspaces.push(workspace);
     }
 
+    /// Insert a new empty workspace at `at` (clamped to the strip), shifting
+    /// later workspaces to the right.
+    ///
+    /// Used by the scrolling-mode window semantics to open a new column
+    /// directly right of the active one. Coordinates of every workspace are
+    /// re-published afterwards so external workspace lists (cosmic panel,
+    /// toplevel management) stay in sync with the shifted indices; the strip
+    /// offset is only re-clamped to the grown strip — panning to the new
+    /// column is the caller's decision.
+    fn insert_workspace_at(&mut self, state: &mut WorkspaceUpdateGuard<State>, at: usize) {
+        let workspace = create_workspace(
+            state,
+            &self.output,
+            &self.group,
+            false,
+            self.tiling_enabled,
+            self.theme.clone(),
+            self.appearance,
+        );
+        let at = at.min(self.workspaces.len());
+        self.workspaces.insert(at, workspace);
+        self.update_workspace_idxs(state);
+        self.strip_offset = workspace_strip::StripState::offset_after_insert(
+            self.strip_offset,
+            self.workspaces.len(),
+            self.strip_column_width(),
+        );
+    }
+
     fn ensure_last_empty(
         &mut self,
         state: &mut WorkspaceUpdateGuard<State>,
@@ -3023,40 +3052,71 @@ impl Shell {
         };
 
         let should_be_fullscreen = output.is_some();
-        let mut output = output.unwrap_or_else(|| seat.active_output());
+        let pending_output = output.unwrap_or_else(|| seat.active_output());
 
-        // this is beyond stupid, just to make the borrow checker happy
-        let workspace = if let Some(handle) = workspace_handle.filter(|handle| {
-            self.workspaces
-                .spaces()
-                .any(|space| &space.handle == handle)
-        }) {
-            self.workspaces
-                .spaces_mut()
-                .find(|space| space.handle == handle)
-                .unwrap()
-        } else {
-            self.workspaces.active_mut(&output).unwrap() // a seat's active output always has a workspace
-        };
-        if output != workspace.output {
-            output = workspace.output.clone();
+        let is_dialog = layout::is_dialog(&window);
+        let floating_exception = layout::has_floating_exception(&self.tiling_exceptions, &window);
+
+        // Target workspace for the window: the one referenced by a pending
+        // activation context if any, otherwise the active workspace of the
+        // pending output.
+        let (output, mut workspace_idx) = workspace_handle
+            .as_ref()
+            .and_then(|handle| {
+                self.workspaces.iter().find_map(|(output, set)| {
+                    set.workspaces
+                        .iter()
+                        .position(|w| &w.handle == handle)
+                        .map(|idx| (output.clone(), idx))
+                })
+            })
+            .unwrap_or_else(|| {
+                let idx = self.workspaces.active_num(&pending_output).1;
+                (pending_output.clone(), idx)
+            });
+
+        // Scrolling semantics (niri-like): a plain new window opens as a new
+        // column immediately right of the active one and the viewport pans
+        // onto it. Explicit targets (activation context, fullscreen request,
+        // sticky window), dialogs and floating exceptions keep the default
+        // placement on the active workspace.
+        let mut new_column = false;
+        if workspace_handle.is_none()
+            && !should_be_fullscreen
+            && !should_be_sticky
+            && !is_dialog
+            && !floating_exception
+            && matches!(self.workspaces.layout, WorkspaceLayout::Scrolling)
+            && self
+                .workspaces
+                .get(workspace_idx, &output)
+                .is_some_and(|workspace| workspace.tiling_enabled)
+        {
+            new_column = true;
+            workspace_idx += 1;
+        }
+
+        toplevel_info.new_toplevel(&window, workspace_state);
+
+        if new_column {
+            // Insert the new column right of the active one and pan the
+            // viewport onto it. The guard is scoped so the raw
+            // `workspace_state` parameter is usable below again.
+            let mut workspace_state = workspace_state.update();
+            let set = self.workspaces.sets.get_mut(&output).unwrap();
+            set.insert_workspace_at(&mut workspace_state, workspace_idx);
+            set.scroll_to_workspace(
+                workspace_idx,
+                WorkspaceDelta::new_shortcut(),
+                &mut workspace_state,
+                true,
+            )
+            .ok();
         }
 
         let active_handle = self.active_space(&output).unwrap().handle;
-        let workspace = if let Some(handle) = workspace_handle.filter(|handle| {
-            self.workspaces
-                .spaces()
-                .any(|space| &space.handle == handle)
-        }) {
-            self.workspaces
-                .spaces_mut()
-                .find(|space| space.handle == handle)
-                .unwrap()
-        } else {
-            self.workspaces.active_mut(&output).unwrap()
-        };
+        let workspace = self.workspaces.get_mut(workspace_idx, &output).unwrap();
 
-        toplevel_info.new_toplevel(&window, workspace_state);
         toplevel_enter_output(&window, &output);
         toplevel_enter_workspace(&window, &workspace.handle);
 
@@ -3066,8 +3126,6 @@ impl Shell {
         let was_activated = workspace_handle.is_some()
             && (workspace_output != seat.active_output() || active_handle != workspace.handle);
         let workspace_handle = workspace.handle;
-        let is_dialog = layout::is_dialog(&window);
-        let floating_exception = layout::has_floating_exception(&self.tiling_exceptions, &window);
 
         if should_be_fullscreen {
             workspace.map_fullscreen(&window, &seat, None, None);
