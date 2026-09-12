@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Special workspace: a second visibility domain on top of the regular
+//! Special workspaces: a second visibility domain on top of the regular
 //! workspaces (the Hyprland `special` workspace / scratchpad concept).
 //!
-//! Windows in the special workspace stay mapped and alive at all times.
-//! While the special workspace is hidden they are detached from every layout —
-//! the same mechanism minimized windows use — so nothing renders or focuses
-//! them. While shown they are attached to the floating layer of the active
-//! workspace of their output, which stacks them above tiled windows without
-//! touching the renderer. Attaching/detaching goes through the same
-//! primitives as [`Shell::move_element`], so the workspace protocol,
-//! focus stacks and reactive popups keep working.
+//! Windows in a special workspace stay mapped and alive at all times. While
+//! the special workspace is hidden they are detached from every layout — the
+//! same mechanism minimized windows use — so nothing renders or focuses them.
+//! While shown they are attached to the floating layer of the active
+//! workspace, which stacks them above tiled windows without touching the
+//! renderer. Attaching/detaching goes through the same primitives as
+//! [`Shell::move_element`], so the workspace protocol, focus stacks and
+//! reactive popups keep working.
+//!
+//! Specials are numbered (`special 1..N`, bound to logo+F1..F12 by the
+//! internal defaults) and independent: showing one does not hide the others.
 
 use smithay::input::Seat;
 use smithay::output::Output;
@@ -24,7 +27,7 @@ use crate::wayland::protocols::toplevel_info::{
     toplevel_enter_workspace, toplevel_leave_workspace,
 };
 
-/// Pure bookkeeping of the special workspace, generic over the window type so
+/// Pure bookkeeping of one special workspace, generic over the window type so
 /// the policy can be unit tested without a compositor backend.
 #[derive(Debug)]
 struct SpecialStore<T> {
@@ -70,6 +73,14 @@ impl<T> SpecialStore<T> {
         self.entries.get_mut(idx)
     }
 
+    fn take<U>(&mut self, key: &U) -> Option<T>
+    where
+        T: PartialEq<U>,
+    {
+        let idx = self.entries.iter().position(|e| e == key)?;
+        Some(self.entries.remove(idx))
+    }
+
     fn retain(&mut self, keep: impl Fn(&T) -> bool) {
         self.entries.retain(keep);
     }
@@ -84,6 +95,10 @@ impl<T> SpecialStore<T> {
 
     fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
     }
 }
 
@@ -111,62 +126,75 @@ impl PartialEq<CosmicMapped> for SpecialWindow {
 
 #[derive(Default)]
 pub struct SpecialWorkspaceManager {
-    store: SpecialStore<SpecialWindow>,
+    /// Numbered special workspaces, grown on demand so `special 7` can exist
+    /// without materializing 1..6 first.
+    specials: Vec<SpecialStore<SpecialWindow>>,
 }
 
 impl std::fmt::Debug for SpecialWorkspaceManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SpecialWorkspaceManager")
-            .field("shown", &self.store.shown())
-            .field("windows", &self.store.entries().count())
+            .field(
+                "specials",
+                &self
+                    .specials
+                    .iter()
+                    .map(|s| (s.shown(), s.len()))
+                    .collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
 
 impl SpecialWorkspaceManager {
-    fn send(&mut self, mapped: CosmicMapped, restore: Option<WorkspaceRestoreData>) {
-        self.store.send(SpecialWindow {
-            mapped,
-            restore,
-            attached_to: None,
-        });
+    fn slot_mut(&mut self, idx: usize) -> &mut SpecialStore<SpecialWindow> {
+        while self.specials.len() <= idx {
+            self.specials.push(SpecialStore::default());
+        }
+        &mut self.specials[idx]
     }
 
-    fn contains(&self, mapped: &CosmicMapped) -> bool {
-        self.store.contains(mapped)
-    }
-
-    fn shown(&self) -> bool {
-        self.store.shown()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.store.is_empty()
-    }
-
-    fn len(&self) -> usize {
-        self.store.entries().count()
+    /// Which special holds `window`, and whether it is currently shown.
+    fn holder(&self, mapped: &CosmicMapped) -> Option<(usize, bool)> {
+        self.specials
+            .iter()
+            .position(|s| s.contains(mapped))
+            .map(|idx| (idx, self.specials[idx].shown()))
     }
 
     fn drop_dead(&mut self) {
-        self.store.retain(|w| w.mapped.alive());
+        for slot in &mut self.specials {
+            slot.retain(|w| w.mapped.alive());
+        }
+    }
+
+    fn shown_any(&self) -> bool {
+        self.specials.iter().any(|s| s.shown())
+    }
+
+    fn index_of(&self, mapped: &CosmicMapped) -> Option<usize> {
+        self.specials.iter().position(|s| s.contains(mapped))
     }
 }
 
 impl Shell {
-    /// Show the special workspace if it is hidden, hide it if it is shown.
+    /// Show special workspace `idx` if it is hidden, hide it if it is shown.
     ///
     /// Returns a focus candidate for the remaining windows, so the caller can
     /// keep the keyboard on the workspace instead of the detached windows.
-    pub fn special_toggle(&mut self, seat: &Seat<State>) -> Option<KeyboardFocusTarget> {
-        debug!(target: "special_ws", shown = self.special.shown(), windows = self.special.len(), "toggle special workspace");
+    pub fn special_toggle(
+        &mut self,
+        seat: &Seat<State>,
+        idx: usize,
+    ) -> Option<KeyboardFocusTarget> {
         self.special.drop_dead();
         let output = seat.active_output();
-        if self.special.shown() {
-            self.special.store.set_shown(false);
+        if self.special.slot_mut(idx).shown() {
+            debug!(special = idx + 1, "hide special workspace");
+            self.special.slot_mut(idx).set_shown(false);
             let attached: Vec<CosmicMapped> = self
                 .special
-                .store
+                .slot_mut(idx)
                 .entries()
                 .filter(|w| w.attached_to.is_some())
                 .map(|w| w.mapped.clone())
@@ -176,14 +204,16 @@ impl Shell {
             }
             self.special_focus_candidate(&output)
         } else {
-            self.special.store.set_shown(true);
-            let mut focus = None;
-            if self.special.is_empty() {
+            self.special.slot_mut(idx).set_shown(true);
+            if self.special.slot_mut(idx).is_empty() {
+                debug!(special = idx + 1, "show special workspace (empty)");
                 return None;
             }
+            debug!(special = idx + 1, "show special workspace");
+            let mut focus = None;
             let detached: Vec<CosmicMapped> = self
                 .special
-                .store
+                .slot_mut(idx)
                 .entries()
                 .filter(|w| w.attached_to.is_none())
                 .map(|w| w.mapped.clone())
@@ -195,26 +225,43 @@ impl Shell {
         }
     }
 
-    /// Send the currently focused window to the special workspace.
+    /// Send the currently focused window to special workspace `idx`.
     ///
-    /// While the special workspace is shown the window becomes visible
-    /// immediately; while hidden it is parked detached and invisible.
-    pub fn special_send_current(&mut self, seat: &Seat<State>) -> Option<KeyboardFocusTarget> {
-        debug!(target: "special_ws", "send focused window to special workspace");
+    /// While that special is shown the window becomes visible immediately;
+    /// while hidden it is parked detached and invisible. Sending a window that
+    /// already belongs to another special moves it between specials.
+    pub fn special_send_current(
+        &mut self,
+        seat: &Seat<State>,
+        idx: usize,
+    ) -> Option<KeyboardFocusTarget> {
         self.special.drop_dead();
         let KeyboardFocusTarget::Element(window) = seat.get_keyboard()?.current_focus()? else {
             return None;
         };
+        debug!(
+            special = idx + 1,
+            "send focused window to special workspace"
+        );
         let output = seat.active_output();
-        if self.special.contains(&window) {
-            // Already in the special workspace: detach it from the floating
-            // layer it may currently be shown on, keeping it stored.
-            self.special_detach_shown(&window, &output);
+
+        let entry = if let Some((from, was_shown)) = self.special.holder(&window) {
+            if was_shown {
+                self.special_detach_shown(&window, &output);
+            }
+            self.special.slot_mut(from).take(&window)
         } else {
-            self.special_detach_window(&window)?;
-        }
-        if self.special.shown() {
-            self.special_attach_to_active(&window, &output)?;
+            let restore = self.special_detach_window(&window)?;
+            Some(SpecialWindow {
+                mapped: window.clone(),
+                restore: Some(restore),
+                attached_to: None,
+            })
+        };
+        self.special.slot_mut(idx).send(entry?);
+
+        if self.special.slot_mut(idx).shown() {
+            return self.special_attach_to_active(&window, &output);
         }
         self.special_focus_candidate(&output)
     }
@@ -222,29 +269,34 @@ impl Shell {
     /// Re-attach shown special windows to the newly activated workspace: a
     /// workspace switch would otherwise leave them floating on the old one.
     pub fn special_follow(&mut self, output: &Output) {
-        if !self.special.shown() {
+        if !self.special.shown_any() {
             return;
         }
         let Some(current) = self.active_space(output).map(|ws| ws.handle) else {
             return;
         };
-        let drifting: Vec<CosmicMapped> = self
-            .special
-            .store
-            .entries()
-            .filter(|w| w.attached_to.as_ref().is_some_and(|h| *h != current))
-            .map(|w| w.mapped.clone())
-            .collect();
-        for window in drifting {
-            if self.special_detach_shown(&window, output).is_some() {
-                self.special_attach_to_active(&window, output);
+        for idx in 0..self.special.specials.len() {
+            if !self.special.slot_mut(idx).shown() {
+                continue;
+            }
+            let drifting: Vec<CosmicMapped> = self
+                .special
+                .slot_mut(idx)
+                .entries()
+                .filter(|w| w.attached_to.as_ref().is_some_and(|h| *h != current))
+                .map(|w| w.mapped.clone())
+                .collect();
+            for window in drifting {
+                if self.special_detach_shown(&window, output).is_some() {
+                    self.special_attach_to_active(&window, output);
+                }
             }
         }
     }
 
-    /// Detach a window from its workspace layout into the special store,
-    /// mirroring the detach half of `Shell::move_element`.
-    fn special_detach_window(&mut self, window: &CosmicMapped) -> Option<()> {
+    /// Detach a window from its workspace layout, mirroring the detach half
+    /// of `Shell::move_element`. Returns the captured restore state.
+    fn special_detach_window(&mut self, window: &CosmicMapped) -> Option<WorkspaceRestoreData> {
         let (handle, restore) = {
             let workspace = self
                 .workspaces
@@ -259,12 +311,11 @@ impl Shell {
         for (toplevel, _) in window.windows() {
             toplevel_leave_workspace(&toplevel, &handle);
         }
-        self.special.send(window.clone(), Some(restore));
-        Some(())
+        Some(restore)
     }
 
     /// Detach a shown window from the workspace it is floating on. Windows
-    /// stay in the store; only the visible attachment is removed.
+    /// stay in their special store; only the visible attachment is removed.
     fn special_detach_shown(&mut self, window: &CosmicMapped, output: &Output) -> Option<()> {
         let handle = {
             let workspace = self
@@ -281,7 +332,8 @@ impl Shell {
         for (toplevel, _) in window.windows() {
             toplevel_leave_workspace(&toplevel, &handle);
         }
-        if let Some(entry) = self.special.store.entry_mut(window) {
+        let idx = self.special.index_of(window)?;
+        if let Some(entry) = self.special.slot_mut(idx).entry_mut(window) {
             entry.attached_to = None;
         }
         Some(())
@@ -302,7 +354,8 @@ impl Shell {
         for (toplevel, _) in window.windows() {
             toplevel_enter_workspace(&toplevel, &handle);
         }
-        if let Some(entry) = self.special.store.entry_mut(window) {
+        let idx = self.special.index_of(window)?;
+        if let Some(entry) = self.special.slot_mut(idx).entry_mut(window) {
             entry.attached_to = Some(handle);
         }
         Some(KeyboardFocusTarget::Element(window.clone()))
@@ -368,5 +421,26 @@ mod tests {
         let mut store = SpecialStore::<char>::default();
         store.set_shown(true);
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn take_removes_window_from_slot() {
+        let mut store = SpecialStore::<char>::default();
+        store.send('a');
+        assert_eq!(store.take(&'a'), Some('a'));
+        assert!(!store.contains(&'a'));
+    }
+
+    #[test]
+    fn slots_are_independent() {
+        // Two stores side by side never share visibility or entries — this is
+        // the invariant the numbered specials rely on.
+        let mut first = SpecialStore::<char>::default();
+        let mut second = SpecialStore::<char>::default();
+        first.send('a');
+        first.set_shown(true);
+        assert!(first.shown());
+        assert!(!second.shown());
+        assert!(!second.contains(&'a'));
     }
 }

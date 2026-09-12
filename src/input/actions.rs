@@ -111,15 +111,19 @@ impl State {
                 }
             }
 
-            Action::Private(PrivateAction::ToggleSpecial) => {
-                let target = self.common.shell.write().special_toggle(seat);
+            Action::Private(PrivateAction::ToggleSpecial(idx)) => {
+                let target = self.common.shell.write().special_toggle(seat, idx as usize);
                 if let Some(target) = target {
                     Shell::set_focus(self, Some(&target), seat, Some(serial), true);
                 }
             }
 
-            Action::Private(PrivateAction::SendToSpecial) => {
-                let target = self.common.shell.write().special_send_current(seat);
+            Action::Private(PrivateAction::SendToSpecial(idx)) => {
+                let target = self
+                    .common
+                    .shell
+                    .write()
+                    .special_send_current(seat, idx as usize);
                 if let Some(target) = target {
                     Shell::set_focus(self, Some(&target), seat, Some(serial), true);
                 }

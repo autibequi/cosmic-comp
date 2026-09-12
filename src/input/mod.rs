@@ -2488,28 +2488,34 @@ impl State {
         // (cosmic-settings-config); until that exists these mirror the
         // internal Escape handling above.
         //
-        // Toggle: logo+F1. Send: logo+shift+F1.
-        let special_sym = handle.modified_sym() == Keysym::F1;
-        if special_sym && key_state == KeyState::Pressed {
-            debug!(?modifiers, "F1 pressed — checking special workspace chords");
+        // Toggle: logo+F1..F12 -> special 1..12. Send: logo+shift+F1..F12.
+        // The F1..F12 keysyms are consecutive, so the special number falls
+        // straight out of the keysym value.
+        let raw = handle.modified_sym().raw();
+        let special_num = if (Keysym::F1.raw()..=Keysym::F12.raw()).contains(&raw) {
+            (raw - Keysym::F1.raw() + 1) as u8
+        } else {
+            0
+        };
+        if special_num > 0 && key_state == KeyState::Pressed {
+            debug!(
+                ?modifiers,
+                special = special_num,
+                "F-key pressed — checking special workspace chords"
+            );
         }
-        let toggle_special = special_sym
+        let usable = special_num > 0
             && key_state == KeyState::Pressed
             && modifiers.logo
             && !modifiers.ctrl
-            && !modifiers.shift
             && !modifiers.alt;
-        let send_special = special_sym
-            && key_state == KeyState::Pressed
-            && modifiers.logo
-            && modifiers.shift
-            && !modifiers.ctrl
-            && !modifiers.alt;
+        let toggle_special = usable && !modifiers.shift;
+        let send_special = usable && modifiers.shift;
         if toggle_special || send_special {
             let (action, shift) = if send_special {
-                (PrivateAction::SendToSpecial, true)
+                (PrivateAction::SendToSpecial(special_num), true)
             } else {
-                (PrivateAction::ToggleSpecial, false)
+                (PrivateAction::ToggleSpecial(special_num), false)
             };
             seat.supressed_keys().add(backend_id, &handle, None);
             return FilterResult::Intercept(Some((
@@ -2521,7 +2527,7 @@ impl State {
                         ..Default::default()
                     },
                     keycode: None,
-                    key: Some(Keysym::F1),
+                    key: Some(handle.modified_sym()),
                     description: None,
                 },
             )));
