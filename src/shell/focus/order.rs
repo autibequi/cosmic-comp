@@ -16,6 +16,7 @@ use crate::{
         SeatExt, Shell, Workspace, WorkspaceDelta,
         focus::target::KeyboardFocusTarget,
         layout::{floating::FloatingLayout, tiling::ANIMATION_DURATION},
+        workspace_strip,
     },
     utils::{
         geometry::*,
@@ -231,15 +232,18 @@ fn render_input_order_internal<R: 'static>(
     };
     let has_fullscreen = fullscreen.is_some() && !overview_is_open;
 
-    let (previous, current_offset) = match previous.as_ref() {
-        Some((previous, previous_idx, start)) => {
-            let layout = shell.workspaces.layout;
-
-            let Some(workspace) = shell.workspaces.space_for_handle(previous) else {
-                return ControlFlow::Break(Err(OutputNoMode));
-            };
-            let has_fullscreen = workspace.get_fullscreen(seat).is_some();
-
+    // In scrolling mode a single continuous strip offset drives the whole
+    // render: workspace `i` sits at `i * width - strip_offset` on the
+    // viewport, so neighbouring columns are partially visible at the output
+    // edges and the pan animation is visible frame by frame. With a
+    // transition in flight the offset is synthesized from the transition
+    // delta (same easing as the pair-based path below, which keeps handling
+    // the other layouts); without one it is the live strip offset tracked by
+    // the pan animation on the workspace set.
+    let scrolling = matches!(shell.workspaces.layout, WorkspaceLayout::Scrolling);
+    let strip_width = output_size.w.max(1);
+    let strip_offset = match previous.as_ref() {
+        Some((_, previous_idx, start)) => {
             let (forward, percentage) = match start {
                 WorkspaceDelta::Shortcut(st) => (
                     *previous_idx < current.1,
@@ -264,37 +268,102 @@ fn render_input_order_internal<R: 'static>(
                     (spring.value_at(Instant::now().duration_since(*start)) as f32).clamp(0.0, 1.0),
                 ),
             };
+            ((*previous_idx as f32 + if forward { percentage } else { -percentage })
+                * strip_width as f32) as f64
+        }
+        None => set.strip_offset,
+    };
+    let strip_position = |index: usize| {
+        Point::<i32, Logical>::from((
+            workspace_strip::StripState::column_position(index, strip_offset, strip_width).round()
+                as i32,
+            0,
+        ))
+    };
 
-            let offset = Point::<i32, Logical>::from(match (layout, forward) {
-                (WorkspaceLayout::Vertical, true) => {
-                    (0, (-output_size.h as f32 * percentage).round() as i32)
-                }
-                (WorkspaceLayout::Vertical, false) => {
-                    (0, (output_size.h as f32 * percentage).round() as i32)
-                }
-                (WorkspaceLayout::Horizontal, true) | (WorkspaceLayout::Scrolling, true) => {
-                    ((-output_size.w as f32 * percentage).round() as i32, 0)
-                }
-                (WorkspaceLayout::Horizontal, false) | (WorkspaceLayout::Scrolling, false) => {
-                    ((output_size.w as f32 * percentage).round() as i32, 0)
-                }
-            });
+    // Columns intersecting the viewport (partial visibility included), empty
+    // when a fullscreen window takes over so only the fullscreen workspace
+    // renders.
+    let visible_columns: Vec<(&Workspace, Point<i32, Logical>)> =
+        if scrolling && !has_focused_fullscreen && !has_fullscreen {
+            let (first, last) =
+                workspace_strip::visible_range(strip_offset, set.workspaces.len(), strip_width);
+            set.workspaces[first..=last]
+                .iter()
+                .enumerate()
+                .map(|(i, w)| (w, strip_position(first + i)))
+                .collect()
+        } else {
+            Vec::new()
+        };
 
-            (
-                Some((previous, previous_idx, has_fullscreen, offset)),
-                Point::<i32, Logical>::from(match (layout, forward) {
-                    (WorkspaceLayout::Vertical, true) => (0, output_size.h + offset.y),
-                    (WorkspaceLayout::Vertical, false) => (0, -(output_size.h - offset.y)),
+    let (previous, current_offset) = if scrolling {
+        (None, strip_position(set.active))
+    } else {
+        match previous.as_ref() {
+            Some((previous, previous_idx, start)) => {
+                let layout = shell.workspaces.layout;
+
+                let Some(workspace) = shell.workspaces.space_for_handle(previous) else {
+                    return ControlFlow::Break(Err(OutputNoMode));
+                };
+                let has_fullscreen = workspace.get_fullscreen(seat).is_some();
+
+                let (forward, percentage) = match start {
+                    WorkspaceDelta::Shortcut(st) => (
+                        *previous_idx < current.1,
+                        ease(
+                            EaseInOutCubic,
+                            0.0,
+                            1.0,
+                            Instant::now().duration_since(*st).as_millis() as f32
+                                / ANIMATION_DURATION.as_millis() as f32,
+                        ),
+                    ),
+                    WorkspaceDelta::Gesture {
+                        percentage: prog,
+                        forward,
+                    } => (*forward, *prog as f32),
+                    WorkspaceDelta::GestureEnd {
+                        start,
+                        spring,
+                        forward,
+                    } => (
+                        *forward,
+                        (spring.value_at(Instant::now().duration_since(*start)) as f32)
+                            .clamp(0.0, 1.0),
+                    ),
+                };
+
+                let offset = Point::<i32, Logical>::from(match (layout, forward) {
+                    (WorkspaceLayout::Vertical, true) => {
+                        (0, (-output_size.h as f32 * percentage).round() as i32)
+                    }
+                    (WorkspaceLayout::Vertical, false) => {
+                        (0, (output_size.h as f32 * percentage).round() as i32)
+                    }
                     (WorkspaceLayout::Horizontal, true) | (WorkspaceLayout::Scrolling, true) => {
-                        (output_size.w + offset.x, 0)
+                        ((-output_size.w as f32 * percentage).round() as i32, 0)
                     }
                     (WorkspaceLayout::Horizontal, false) | (WorkspaceLayout::Scrolling, false) => {
-                        (-(output_size.w - offset.x), 0)
+                        ((output_size.w as f32 * percentage).round() as i32, 0)
                     }
-                }),
-            )
+                });
+
+                (
+                    Some((previous, previous_idx, has_fullscreen, offset)),
+                    Point::<i32, Logical>::from(match (layout, forward) {
+                        (WorkspaceLayout::Vertical, true) => (0, output_size.h + offset.y),
+                        (WorkspaceLayout::Vertical, false) => (0, -(output_size.h - offset.y)),
+                        (WorkspaceLayout::Horizontal, true)
+                        | (WorkspaceLayout::Scrolling, true) => (output_size.w + offset.x, 0),
+                        (WorkspaceLayout::Horizontal, false)
+                        | (WorkspaceLayout::Scrolling, false) => (-(output_size.w - offset.x), 0),
+                    }),
+                )
+            }
+            None => (None, Point::default()),
         }
-        None => (None, Point::default()),
     };
 
     // Top-level layer shell popups
@@ -334,27 +403,38 @@ fn render_input_order_internal<R: 'static>(
     }
 
     if element_filter != ElementFilter::LayerShellOnly {
-        // previous workspace popups
-        if let Some((previous_handle, _, _, offset)) = previous.as_ref() {
-            let Some(workspace) = shell.workspaces.space_for_handle(previous_handle) else {
+        if !visible_columns.is_empty() {
+            // scrolling strip: popups of every visible column at its own
+            // continuous offset
+            for (workspace, offset) in &visible_columns {
+                callback(Stage::WorkspacePopups {
+                    workspace,
+                    offset: *offset,
+                })?;
+            }
+        } else {
+            // previous workspace popups
+            if let Some((previous_handle, _, _, offset)) = previous.as_ref() {
+                let Some(workspace) = shell.workspaces.space_for_handle(previous_handle) else {
+                    return ControlFlow::Break(Err(OutputNoMode));
+                };
+
+                callback(Stage::WorkspacePopups {
+                    workspace,
+                    offset: *offset,
+                })?;
+            }
+
+            // current workspace popups
+            let Some(workspace) = shell.workspaces.space_for_handle(&current.0) else {
                 return ControlFlow::Break(Err(OutputNoMode));
             };
 
             callback(Stage::WorkspacePopups {
                 workspace,
-                offset: *offset,
+                offset: current_offset,
             })?;
         }
-
-        // current workspace popups
-        let Some(workspace) = shell.workspaces.space_for_handle(&current.0) else {
-            return ControlFlow::Break(Err(OutputNoMode));
-        };
-
-        callback(Stage::WorkspacePopups {
-            workspace,
-            offset: current_offset,
-        })?;
     }
 
     if !has_focused_fullscreen {
@@ -427,20 +507,31 @@ fn render_input_order_internal<R: 'static>(
 
     if element_filter != ElementFilter::LayerShellOnly {
         // workspace windows
-        callback(Stage::Workspace {
-            workspace,
-            offset: current_offset,
-        })?;
-
-        // previous workspace windows
-        if let Some((previous_handle, _, _, offset)) = previous.as_ref() {
-            let Some(workspace) = shell.workspaces.space_for_handle(previous_handle) else {
-                return ControlFlow::Break(Err(OutputNoMode));
-            };
+        if !visible_columns.is_empty() {
+            // scrolling strip: every visible column at its own continuous
+            // offset (neighbours partially clipped at the output edges)
+            for (workspace, offset) in &visible_columns {
+                callback(Stage::Workspace {
+                    workspace,
+                    offset: *offset,
+                })?;
+            }
+        } else {
             callback(Stage::Workspace {
                 workspace,
-                offset: *offset,
+                offset: current_offset,
             })?;
+
+            // previous workspace windows
+            if let Some((previous_handle, _, _, offset)) = previous.as_ref() {
+                let Some(workspace) = shell.workspaces.space_for_handle(previous_handle) else {
+                    return ControlFlow::Break(Err(OutputNoMode));
+                };
+                callback(Stage::Workspace {
+                    workspace,
+                    offset: *offset,
+                })?;
+            }
         }
     }
 

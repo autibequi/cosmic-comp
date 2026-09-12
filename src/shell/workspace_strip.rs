@@ -79,6 +79,27 @@ pub fn stepped_index(current: usize, delta: i32, count: usize, wraparound: bool)
     }
 }
 
+/// Column index where a newly opened window should land in scrolling mode:
+/// immediately to the right of the active column, clamped to the strip
+/// (a new workspace appended at the end when the active one is the last).
+pub fn insert_index(active: usize, count: usize) -> usize {
+    (active + 1).min(count)
+}
+
+/// Inclusive range of column indices that intersect the viewport of
+/// `width` at `offset`, clamped to `count` columns. Partially visible
+/// columns at the viewport edges are included.
+pub fn visible_range(offset: f64, count: usize, width: i32) -> (usize, usize) {
+    if count == 0 {
+        return (0, 0);
+    }
+    let width_f = width.max(1) as f64;
+    let first = (offset.max(0.0) / width_f).floor() as usize;
+    let last = ((offset + width_f - 1.0).max(0.0) / width_f).floor() as usize;
+    let max = count - 1;
+    (first.min(max), last.min(max))
+}
+
 /// Continuous viewport offset of the strip for one output.
 ///
 /// This is purely spatial state: `active_space` (the workspace index) remains
@@ -402,6 +423,34 @@ mod tests {
     #[test]
     fn default_viewport_is_first_column() {
         assert_eq!(default_viewport(Size::from((W, 1080))), Point::from((0, 0)));
+    }
+
+    #[test]
+    fn insert_index_is_right_of_active_clamped() {
+        // Niri semantics: a new window opens one column to the right of the
+        // active one; on the last column it appends a new one.
+        assert_eq!(insert_index(0, 3), 1);
+        assert_eq!(insert_index(1, 3), 2);
+        // Active is the last column: the insert index is the new strip end.
+        assert_eq!(insert_index(2, 3), 3);
+        // Degenerate strips clamp to 0.
+        assert_eq!(insert_index(0, 0), 0);
+    }
+
+    #[test]
+    fn visible_range_covers_partial_columns() {
+        // Settled viewport on column 1: only column 1 is visible.
+        assert_eq!(visible_range(1.0 * W as f64, 5, W), (1, 1));
+        // Halfway between columns 1 and 2: both are (partially) visible.
+        assert_eq!(visible_range(1.5 * W as f64, 5, W), (1, 2));
+        // A sliver of the next column already counts as visible.
+        assert_eq!(visible_range(1.0 * W as f64 + 1.0, 5, W), (1, 2));
+        // Clamp at both strip ends.
+        assert_eq!(visible_range(-3.0 * W as f64, 3, W), (0, 0));
+        assert_eq!(visible_range(9.0 * W as f64, 3, W), (2, 2));
+        // Degenerate strips.
+        assert_eq!(visible_range(0.0, 0, W), (0, 0));
+        assert_eq!(visible_range(0.0, 1, W), (0, 0));
     }
 
     mod pan {
