@@ -377,6 +377,13 @@ pub struct WorkspaceSet {
     /// Pan animation driving `strip_offset` towards the target of `active`.
     /// Purely visual: `active` has already changed when this starts.
     strip_anim: Option<workspace_strip::PanAnimation>,
+    /// Ongoing continuous drag of the strip (scrolling mode gestures). While
+    /// set, `strip_offset` tracks the finger 1:1 and `active` is untouched;
+    /// the release snaps to the nearest column via `scroll_to_workspace`.
+    strip_drag: Option<workspace_strip::StripDrag>,
+    /// Column width the strip state was last derived from, to detect output
+    /// resizes/hotplugs (the offset is pixel-based).
+    strip_width: i32,
     pub group: WorkspaceGroupHandle,
     tiling_enabled: bool,
     output: Output,
@@ -534,6 +541,8 @@ impl WorkspaceSet {
             active: 0,
             strip_offset: workspace_strip::StripState::default().offset,
             strip_anim: None,
+            strip_drag: None,
+            strip_width: output.current_mode().map(|mode| mode.size.w).unwrap_or(0),
             group: group_handle,
             tiling_enabled,
             theme: theme.clone(),
@@ -653,6 +662,72 @@ impl WorkspaceSet {
         }
     }
 
+    /// Begin a continuous strip drag (scrolling mode gestures): the current
+    /// visual offset becomes the drag origin and any pan animation is
+    /// superseded. Idempotent — only the first call records the origin.
+    fn begin_strip_drag(&mut self) {
+        if self.strip_drag.is_some() {
+            return;
+        }
+        let now = Instant::now();
+        let from = self
+            .strip_anim
+            .take()
+            .map_or(self.strip_offset, |anim| anim.value(now));
+        self.strip_offset = from;
+        // The drag is now the only driver of the visual offset; a pending
+        // pair-based transition would override it in the render synthesis.
+        self.previously_active = None;
+        self.strip_drag = Some(workspace_strip::StripDrag::begin(from));
+    }
+
+    /// Track the finger during a strip drag: the forward-positive pixel
+    /// `delta` maps 1:1 onto the viewport offset, hard-clamped to the strip
+    /// bounds (no rubber-band). The active workspace stays untouched — the
+    /// offset is purely visual until the release snaps.
+    fn update_strip_drag(&mut self, delta: f64, forward: bool) {
+        self.begin_strip_drag();
+        let drag = self.strip_drag.unwrap();
+        let signed = if forward { delta } else { -delta };
+        self.strip_offset =
+            drag.dragged_offset(signed, self.workspaces.len(), self.strip_column_width());
+    }
+
+    /// Release a strip drag: snap to the column nearest to the current
+    /// offset via the standard short pan animation (no velocity fling in
+    /// the MVP). Returns whether the active workspace changed.
+    fn end_strip_drag(
+        &mut self,
+        state: &mut WorkspaceUpdateGuard<'_, State>,
+        animate_strip: bool,
+    ) -> Result<bool, InvalidWorkspaceIndex> {
+        if self.strip_drag.take().is_none() {
+            return Ok(false);
+        }
+        let idx = workspace_strip::StripDrag::nearest_index(
+            self.strip_offset,
+            self.workspaces.len(),
+            self.strip_column_width(),
+        );
+        // Same overview guard as `scroll_to_workspace`: no animation while
+        // the workspace overview covers the output.
+        let animate = !layer_map_for_output(&self.output)
+            .layers()
+            .any(|l| l.namespace() == WORKSPACE_OVERVIEW_NAMESPACE);
+        let changed = if idx != self.active {
+            self.scroll_to_workspace(idx, WorkspaceDelta::new_shortcut(), state, animate_strip)?
+        } else {
+            // Released within the active column: snap the visual offset
+            // back with the same short pan.
+            self.start_strip_pan(animate && animate_strip);
+            true
+        };
+        // The pan animation drives the snap from the live drag offset; the
+        // pair-based transition would restart from the old column origin.
+        self.previously_active = None;
+        Ok(changed)
+    }
+
     fn activate_previous(
         &mut self,
         workspace_delta: WorkspaceDelta,
@@ -691,6 +766,17 @@ impl WorkspaceSet {
     }
 
     fn refresh(&mut self) {
+        // Output resize / hotplug: the strip offset is pixel-based, so a
+        // column width change invalidates the pan and any ongoing drag;
+        // re-derive the offset from `active` (the source of truth) at the
+        // new width.
+        let width = self.strip_column_width();
+        if width != self.strip_width {
+            self.strip_width = width;
+            self.strip_anim = None;
+            self.strip_drag = None;
+            self.strip_offset = self.snapped_strip_offset();
+        }
         if let Some((_, start)) = self.previously_active {
             match start {
                 WorkspaceDelta::Shortcut(st) => {
@@ -1942,6 +2028,66 @@ impl Shell {
                 }
             }
         }
+    }
+
+    /// Begin a continuous strip drag of the scrolling layout (the discrete
+    /// gesture pipeline decides direction/action; scrolling mode reuses it
+    /// and only swaps the offset update). Idempotent per set.
+    pub fn begin_workspace_strip_drag(&mut self, output: &Output) {
+        match &mut self.workspaces.mode {
+            WorkspaceMode::OutputBound => {
+                if let Some(set) = self.workspaces.sets.get_mut(output) {
+                    set.begin_strip_drag();
+                }
+            }
+            WorkspaceMode::Global => {
+                for set in self.workspaces.sets.values_mut() {
+                    set.begin_strip_drag();
+                }
+            }
+        }
+    }
+
+    /// Track a continuous strip drag: `delta` is the forward-positive pixel
+    /// distance swiped so far; the viewport offset follows it 1:1 while the
+    /// active workspace stays on the current column until the release.
+    pub fn update_workspace_strip_drag(&mut self, output: &Output, delta: f64, forward: bool) {
+        match &mut self.workspaces.mode {
+            WorkspaceMode::OutputBound => {
+                if let Some(set) = self.workspaces.sets.get_mut(output) {
+                    set.update_strip_drag(delta, forward);
+                }
+            }
+            WorkspaceMode::Global => {
+                for set in self.workspaces.sets.values_mut() {
+                    set.update_strip_drag(delta, forward);
+                }
+            }
+        }
+    }
+
+    /// Release a continuous strip drag: snap to the column nearest to the
+    /// dragged offset with the standard short pan (no velocity fling).
+    pub fn end_workspace_strip_drag(
+        &mut self,
+        output: &Output,
+        workspace_state: &mut WorkspaceUpdateGuard<'_, State>,
+    ) -> Result<Point<i32, Global>, InvalidWorkspaceIndex> {
+        let animate_strip = matches!(self.workspaces.layout, WorkspaceLayout::Scrolling);
+        match &mut self.workspaces.mode {
+            WorkspaceMode::OutputBound => {
+                if let Some(set) = self.workspaces.sets.get_mut(output) {
+                    set.end_strip_drag(workspace_state, animate_strip)?;
+                }
+            }
+            WorkspaceMode::Global => {
+                for set in self.workspaces.sets.values_mut() {
+                    set.end_strip_drag(workspace_state, animate_strip)?;
+                }
+            }
+        }
+        let output_geo = output.geometry();
+        Ok(output_geo.loc + Point::from((output_geo.size.w / 2, output_geo.size.h / 2)))
     }
 
     pub fn end_workspace_swipe(

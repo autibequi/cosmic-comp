@@ -189,6 +189,48 @@ impl StripState {
     }
 }
 
+/// Ongoing drag of the strip by a pointer/touch gesture (scrolling mode).
+///
+/// The finger delta maps 1:1 onto the viewport offset (hard-clamped to the
+/// strip bounds, no rubber-band) while the active workspace stays untouched;
+/// only the release snaps to a column (see [`StripDrag::nearest_index`]) and
+/// thereby changes `active`. The caller normalizes the raw finger movement
+/// into a forward-positive `delta` (swiping towards the next column is
+/// positive) so the policy itself stays sign-agnostic.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StripDrag {
+    start_offset: f64,
+}
+
+impl StripDrag {
+    /// Start dragging from `start_offset` (the current visual offset).
+    pub fn begin(start_offset: f64) -> Self {
+        Self { start_offset }
+    }
+
+    /// Offset the drag started from.
+    pub fn start_offset(&self) -> f64 {
+        self.start_offset
+    }
+
+    /// Viewport offset for a forward-positive drag `delta` (pixels),
+    /// clamped to the strip of `count` columns of `width`.
+    pub fn dragged_offset(&self, delta: f64, count: usize, width: i32) -> f64 {
+        StripState::clamp_offset(self.start_offset + delta, count, width)
+    }
+
+    /// Column index a release at `offset` snaps to: the nearest column, ties
+    /// rounding away from zero progress (i.e. a drag past half a column
+    /// commits to the next one). Degenerate strips snap to column 0.
+    pub fn nearest_index(offset: f64, count: usize, width: i32) -> usize {
+        if count == 0 {
+            return 0;
+        }
+        let width_f = width.max(1) as f64;
+        ((offset.max(0.0) / width_f).round() as usize).min(count - 1)
+    }
+}
+
 /// Default viewport position for an output: centered on column 0.
 pub fn default_viewport(output_size: Size<i32, Logical>) -> Point<i32, Logical> {
     Point::from((viewport_offset_for_index(0, output_size.w), 0))
@@ -451,6 +493,66 @@ mod tests {
         // Degenerate strips.
         assert_eq!(visible_range(0.0, 0, W), (0, 0));
         assert_eq!(visible_range(0.0, 1, W), (0, 0));
+    }
+
+    mod drag {
+        use super::*;
+
+        const COUNT: usize = 5;
+
+        #[test]
+        fn dragged_offset_tracks_finger_and_clamps() {
+            let drag = StripDrag::begin(1.0 * W as f64);
+            // 1:1 mapping in both directions.
+            assert_eq!(drag.dragged_offset(200.0, COUNT, W), 1.0 * W as f64 + 200.0);
+            assert_eq!(
+                drag.dragged_offset(-300.0, COUNT, W),
+                1.0 * W as f64 - 300.0
+            );
+            // Hard clamp at both strip ends, however far the finger moves.
+            let start = StripDrag::begin(0.0);
+            assert_eq!(start.dragged_offset(-9000.0, COUNT, W), 0.0);
+            let end = StripDrag::begin(4.0 * W as f64);
+            assert_eq!(end.dragged_offset(9000.0, COUNT, W), 4.0 * W as f64);
+            // Degenerate strips clamp to 0.
+            assert_eq!(StripDrag::begin(1.0).dragged_offset(50.0, 0, W), 0.0);
+            assert_eq!(StripDrag::begin(1.0).dragged_offset(50.0, 1, W), 0.0);
+        }
+
+        #[test]
+        fn nearest_index_snaps_half_column() {
+            let w = W as f64;
+            // Below half a column: snap back.
+            assert_eq!(StripDrag::nearest_index(0.49 * w, COUNT, W), 0);
+            // Half a column and beyond: commit to the next one.
+            assert_eq!(StripDrag::nearest_index(0.5 * w, COUNT, W), 1);
+            assert_eq!(StripDrag::nearest_index(1.5 * w, COUNT, W), 2);
+            assert_eq!(StripDrag::nearest_index(1.51 * w, COUNT, W), 2);
+            // Settled offsets are their own index.
+            for idx in 0..COUNT {
+                assert_eq!(StripDrag::nearest_index(idx as f64 * w, COUNT, W), idx);
+            }
+            // Clamp past the strip ends; negative offsets resolve to 0.
+            assert_eq!(StripDrag::nearest_index(9.0 * w, COUNT, W), 4);
+            assert_eq!(StripDrag::nearest_index(-2.0 * w, COUNT, W), 0);
+            // Degenerate strips.
+            assert_eq!(StripDrag::nearest_index(42.0, 0, W), 0);
+            assert_eq!(StripDrag::nearest_index(42.0, 1, W), 0);
+        }
+
+        #[test]
+        fn drag_then_release_snaps_to_nearest() {
+            // Integration of the drag → release pipeline: drag forward by
+            // most of a column, release, and the release offset resolves to
+            // the next column; a shorter drag resolves back to the origin.
+            let drag = StripDrag::begin(1.0 * W as f64);
+            let released = drag.dragged_offset(0.75 * W as f64, COUNT, W);
+            assert_eq!(StripDrag::nearest_index(released, COUNT, W), 2);
+            let released = drag.dragged_offset(0.25 * W as f64, COUNT, W);
+            assert_eq!(StripDrag::nearest_index(released, COUNT, W), 1);
+            let released = drag.dragged_offset(-0.75 * W as f64, COUNT, W);
+            assert_eq!(StripDrag::nearest_index(released, COUNT, W), 0);
+        }
     }
 
     mod pan {

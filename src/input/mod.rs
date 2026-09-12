@@ -1245,11 +1245,30 @@ impl State {
                         match gesture_state.action {
                             Some(x @ SwipeAction::NextWorkspace)
                             | Some(x @ SwipeAction::PrevWorkspace) => {
-                                self.common.shell.write().update_workspace_delta(
-                                    &seat.active_output(),
-                                    gesture_state.delta,
-                                    matches!(x, SwipeAction::NextWorkspace),
-                                )
+                                let forward = matches!(x, SwipeAction::NextWorkspace);
+                                let scrolling = matches!(
+                                    self.common.config.cosmic_conf.workspaces.workspace_layout,
+                                    WorkspaceLayout::Scrolling
+                                );
+                                let mut shell = self.common.shell.write();
+                                if scrolling {
+                                    // Continuous strip drag: the offset
+                                    // follows the finger 1:1 and the release
+                                    // snaps to the nearest column.
+                                    let output = seat.active_output();
+                                    shell.begin_workspace_strip_drag(&output);
+                                    shell.update_workspace_strip_drag(
+                                        &output,
+                                        gesture_state.delta,
+                                        forward,
+                                    );
+                                } else {
+                                    shell.update_workspace_delta(
+                                        &seat.active_output(),
+                                        gesture_state.delta,
+                                        forward,
+                                    );
+                                }
                             }
                             _ => {}
                         }
@@ -1265,7 +1284,18 @@ impl State {
                     }
 
                     if let Some(action) = activate_action {
-                        self.handle_swipe_action(action, &seat);
+                        // In scrolling mode the workspace swipe is a
+                        // continuous drag instead: the active workspace only
+                        // changes on release (see end_workspace_strip_drag),
+                        // so the discrete activate-on-first-update path is
+                        // skipped.
+                        let scrolling = matches!(
+                            self.common.config.cosmic_conf.workspaces.workspace_layout,
+                            WorkspaceLayout::Scrolling
+                        );
+                        if !scrolling {
+                            self.handle_swipe_action(action, &seat);
+                        }
                     }
                 }
             }
@@ -1282,20 +1312,34 @@ impl State {
                     if let Some(ref gesture_state) = self.common.gesture_state {
                         match gesture_state.action {
                             Some(SwipeAction::NextWorkspace) | Some(SwipeAction::PrevWorkspace) => {
-                                let velocity = gesture_state.velocity();
-                                let norm_velocity = if matches!(
+                                let scrolling = matches!(
                                     self.common.config.cosmic_conf.workspaces.workspace_layout,
-                                    WorkspaceLayout::Horizontal | WorkspaceLayout::Scrolling
-                                ) {
-                                    velocity / seat.active_output().geometry().size.w as f64
-                                } else {
-                                    velocity / seat.active_output().geometry().size.h as f64
-                                };
-                                let _ = self.common.shell.write().end_workspace_swipe(
-                                    &seat.active_output(),
-                                    norm_velocity,
-                                    &mut self.common.workspace_state.update(),
+                                    WorkspaceLayout::Scrolling
                                 );
+                                if scrolling {
+                                    // Snap to the nearest column; the drag
+                                    // state carries the release offset, so
+                                    // no velocity is needed (no fling MVP).
+                                    let _ = self.common.shell.write().end_workspace_strip_drag(
+                                        &seat.active_output(),
+                                        &mut self.common.workspace_state.update(),
+                                    );
+                                } else {
+                                    let velocity = gesture_state.velocity();
+                                    let norm_velocity = if matches!(
+                                        self.common.config.cosmic_conf.workspaces.workspace_layout,
+                                        WorkspaceLayout::Horizontal | WorkspaceLayout::Scrolling
+                                    ) {
+                                        velocity / seat.active_output().geometry().size.w as f64
+                                    } else {
+                                        velocity / seat.active_output().geometry().size.h as f64
+                                    };
+                                    let _ = self.common.shell.write().end_workspace_swipe(
+                                        &seat.active_output(),
+                                        norm_velocity,
+                                        &mut self.common.workspace_state.update(),
+                                    );
+                                }
                             }
                             _ => {}
                         }
