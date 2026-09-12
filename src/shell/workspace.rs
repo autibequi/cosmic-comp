@@ -1977,6 +1977,15 @@ impl FocusStacks {
     pub fn get_mut<'a>(&'a mut self, seat: &Seat<State>) -> FocusStackMut<'a> {
         FocusStackMut(self.0.entry(seat.clone()).or_default())
     }
+
+    /// Remove an element from every seat's stack: used when a window leaves
+    /// the workspace's layouts entirely (e.g. into a special workspace), so
+    /// focus fixups do not keep handing the keyboard back to it.
+    pub fn remove_mapped(&mut self, mapped: &CosmicMapped) {
+        self.0.values_mut().for_each(|set| {
+            set.shift_remove(mapped);
+        });
+    }
 }
 
 pub struct OutputNotMapped;
