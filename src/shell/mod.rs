@@ -371,6 +371,9 @@ impl WorkspaceDelta {
 pub struct WorkspaceSet {
     previously_active: Option<(usize, WorkspaceDelta)>,
     pub active: usize,
+    /// Continuous viewport offset of the workspace strip. Purely spatial state
+    /// derived from `active`; see [`workspace_strip::StripState`].
+    strip_offset: f64,
     pub group: WorkspaceGroupHandle,
     tiling_enabled: bool,
     output: Output,
@@ -493,6 +496,26 @@ fn merge_workspaces(
 */
 
 impl WorkspaceSet {
+    /// Column width of the strip on this output's current mode (0 if unknown).
+    fn strip_column_width(&self) -> i32 {
+        self.output
+            .current_mode()
+            .map(|mode| mode.size.w)
+            .unwrap_or(0)
+    }
+
+    /// Re-derive the strip viewport offset from `active` (the single source of
+    /// truth) and the current workspace count, snapping it to the active
+    /// column and clamping it to the strip bounds.
+    fn snapped_strip_offset(&self) -> f64 {
+        let width = self.strip_column_width();
+        workspace_strip::StripState::clamp_offset(
+            workspace_strip::StripState::target_offset(self.active, width),
+            self.workspaces.len(),
+            width,
+        )
+    }
+
     fn new(
         state: &mut WorkspaceUpdateGuard<'_, State>,
         output: &Output,
@@ -506,6 +529,7 @@ impl WorkspaceSet {
         WorkspaceSet {
             previously_active: None,
             active: 0,
+            strip_offset: workspace_strip::StripState::default().offset,
             group: group_handle,
             tiling_enabled,
             theme: theme.clone(),
@@ -545,6 +569,9 @@ impl WorkspaceSet {
                 None
             };
             self.active = idx;
+            // Assignment after the immutable borrow; keeps the `layer_map`
+            // guard borrow of `self.output` non-conflicting.
+            self.strip_offset = self.snapped_strip_offset();
             Ok(true)
         } else {
             // snap to workspace, when in between workspaces due to swipe gesture
@@ -727,6 +754,9 @@ impl WorkspaceSet {
                 workspace_state.add_workspace_state(&workspace.handle, WState::Active);
                 idx
             });
+        // Keep the strip viewport on the same logical column after the
+        // removal reshuffled indices.
+        self.strip_offset = self.snapped_strip_offset();
     }
 
     // Remove a workspace from the set, and return it, for adding to a different

@@ -76,6 +76,95 @@ pub fn stepped_index(current: usize, delta: i32, count: usize, wraparound: bool)
     }
 }
 
+/// Continuous viewport offset of the strip for one output.
+///
+/// This is purely spatial state: `active_space` (the workspace index) remains
+/// the single source of truth for which workspace is active; the offset only
+/// describes where the viewport currently sits on the strip, possibly between
+/// two columns. With `offset == target_offset(active)` the layout is identical
+/// to the discrete per-index positioning.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StripState {
+    /// Current viewport origin x on the strip; `0.0` aligns column 0.
+    pub offset: f64,
+}
+
+impl Default for StripState {
+    fn default() -> Self {
+        Self { offset: 0.0 }
+    }
+}
+
+impl StripState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Inclusive upper bound of the offset for a strip of `count` columns.
+    pub fn max_offset(count: usize, width: i32) -> f64 {
+        count.saturating_sub(1) as f64 * width.max(0) as f64
+    }
+
+    /// Offset clamped to the valid strip range `[0, (count - 1) * width]`.
+    ///
+    /// Wraparound navigation steps through indices; the pan itself always
+    /// happens between adjacent columns, never across the wrap, so the clamp
+    /// range is enough to keep the viewport on the strip.
+    pub fn clamp_offset(offset: f64, count: usize, width: i32) -> f64 {
+        offset.clamp(0.0, Self::max_offset(count, width))
+    }
+
+    /// Offset that makes column `index` fully visible (the snap target).
+    pub fn target_offset(index: usize, width: i32) -> f64 {
+        index as f64 * width.max(0) as f64
+    }
+
+    /// Snap the offset so column `index` is fully visible.
+    pub fn snap_to(&mut self, index: usize, count: usize, width: i32) {
+        self.offset = Self::clamp_offset(Self::target_offset(index, width), count, width);
+    }
+
+    /// X of column `index` relative to the viewport origin for an arbitrary
+    /// (possibly intermediate) offset. Neighbouring columns may be partially
+    /// visible at the viewport edges; clipping to the output is the renderer's
+    /// job, the geometry just has to expose the partial positions.
+    pub fn column_position(index: usize, offset: f64, width: i32) -> f64 {
+        index as f64 * width.max(0) as f64 - offset
+    }
+
+    /// Index of the leftmost column under the viewport, possibly only
+    /// partially visible.
+    pub fn first_visible_index(offset: f64, width: i32) -> usize {
+        (offset.max(0.0) / width.max(1) as f64).floor() as usize
+    }
+
+    /// Offset after the column at `removed_index` was removed.
+    ///
+    /// Removing a column left of the active viewport shifts the offset one
+    /// column width to the left so the viewport stays on the same logical
+    /// column; the result is re-clamped to the shrunk strip.
+    pub fn offset_after_removal(
+        offset: f64,
+        removed_index: usize,
+        old_active: usize,
+        count_after: usize,
+        width: i32,
+    ) -> f64 {
+        let shifted = if removed_index < old_active {
+            offset - width.max(0) as f64
+        } else {
+            offset
+        };
+        Self::clamp_offset(shifted, count_after, width)
+    }
+
+    /// Offset after a column was inserted. Insertion never shifts the
+    /// viewport; the offset is only re-clamped to the (grown) strip.
+    pub fn offset_after_insert(offset: f64, count_after: usize, width: i32) -> f64 {
+        Self::clamp_offset(offset, count_after, width)
+    }
+}
+
 /// Default viewport position for an output: centered on column 0.
 pub fn default_viewport(output_size: Size<i32, Logical>) -> Point<i32, Logical> {
     Point::from((viewport_offset_for_index(0, output_size.w), 0))
@@ -140,6 +229,96 @@ mod tests {
     #[test]
     fn stepped_index_on_empty_strip_is_none() {
         assert_eq!(stepped_index(0, 1, 0, true), None);
+    }
+
+    #[test]
+    fn intermediate_offset_places_neighbours_partially_visible() {
+        // Viewport halfway between columns 1 and 2: both are half visible.
+        let offset = 1.5 * W as f64;
+        let p1 = StripState::column_position(1, offset, W);
+        let p2 = StripState::column_position(2, offset, W);
+        assert_eq!(p1, -(W as f64) / 2.0);
+        assert_eq!(p2, (W as f64) / 2.0);
+        // The leftmost (partially visible) column is still column 1, and both
+        // neighbours straddle the viewport edges `[0, W]`.
+        assert_eq!(StripState::first_visible_index(offset, W), 1);
+        assert!(p1 < 0.0 && p1 + W as f64 > 0.0);
+        assert!(p2 > 0.0 && p2 < W as f64);
+    }
+
+    #[test]
+    fn snapped_offset_matches_discrete_layout() {
+        // With offset == target, the continuous geometry must be identical to
+        // the S1 discrete positioning.
+        for idx in 0..5usize {
+            let offset = StripState::target_offset(idx, W);
+            for col in 0..5usize {
+                let discrete = column_position(col, viewport_offset_for_index(idx, W), W);
+                assert_eq!(
+                    StripState::column_position(col, offset, W),
+                    discrete.x as f64
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn clamp_offset_bounds_the_strip() {
+        assert_eq!(StripState::clamp_offset(-100.0, 5, W), 0.0);
+        assert_eq!(
+            StripState::clamp_offset(4.0 * W as f64, 5, W),
+            4.0 * W as f64
+        );
+        assert_eq!(
+            StripState::clamp_offset(99.0 * W as f64, 5, W),
+            4.0 * W as f64
+        );
+        // Degenerate strips clamp to 0.
+        assert_eq!(StripState::clamp_offset(50.0, 1, W), 0.0);
+        assert_eq!(StripState::clamp_offset(50.0, 0, W), 0.0);
+    }
+
+    #[test]
+    fn snap_to_lands_on_active_column() {
+        let mut strip = StripState::new();
+        assert_eq!(strip.offset, 0.0);
+        strip.snap_to(3, 5, W);
+        assert_eq!(strip.offset, 3.0 * W as f64);
+        // Beyond the last column clamps back onto the strip.
+        strip.snap_to(9, 5, W);
+        assert_eq!(strip.offset, 4.0 * W as f64);
+    }
+
+    #[test]
+    fn removal_before_active_shifts_offset_left() {
+        // Viewport on column 2, remove column 0: same logical column is now
+        // index 1, so the offset shifts one width left.
+        let offset = StripState::target_offset(2, W);
+        assert_eq!(
+            StripState::offset_after_removal(offset, 0, 2, 4, W),
+            StripState::target_offset(1, W)
+        );
+        // Removing a column at or after the active viewport keeps the offset.
+        assert_eq!(StripState::offset_after_removal(offset, 3, 2, 4, W), offset);
+        // Intermediate offsets shift by exactly one width too.
+        let mid = 1.5 * W as f64;
+        assert_eq!(
+            StripState::offset_after_removal(mid, 0, 2, 4, W),
+            mid - W as f64
+        );
+        // Clamp keeps the result on the shrunken strip.
+        assert_eq!(StripState::offset_after_removal(0.0, 0, 0, 3, W), 0.0);
+    }
+
+    #[test]
+    fn insert_never_shifts_the_viewport() {
+        let offset = StripState::target_offset(2, W);
+        assert_eq!(StripState::offset_after_insert(offset, 6, W), offset);
+        // An offset past the (hypothetically shrunk) strip is re-clamped.
+        assert_eq!(
+            StripState::offset_after_insert(4.0 * W as f64, 3, W),
+            2.0 * W as f64
+        );
     }
 
     #[test]
