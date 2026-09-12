@@ -55,6 +55,7 @@ use cosmic_comp_config::{
     output::comp::{
         OutputConfig, OutputInfo, OutputState, OutputsConfig, TransformDef, load_outputs,
     },
+    special::SpecialConfig,
     workspace::WorkspaceConfig,
 };
 pub use key_bindings::{Action, PrivateAction};
@@ -920,6 +921,13 @@ fn config_changed(config: cosmic_config::Config, keys: Vec<String>, state: &mut 
                 if new != state.common.config.cosmic_conf.active_hint {
                     state.common.config.cosmic_conf.active_hint = new;
                     state.common.update_config();
+                }
+            }
+            "special" => {
+                let new = get_config::<SpecialConfig>(&config, "special");
+                if new != state.common.config.cosmic_conf.special {
+                    state.common.config.cosmic_conf.special = new.clone();
+                    state.common.shell.write().special.apply_config(&new);
                 }
             }
             "descale_xwayland" => {

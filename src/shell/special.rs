@@ -14,12 +14,18 @@
 //!
 //! Specials are numbered (`special 1..N`, bound to logo+F1..F12 by the
 //! internal defaults) and independent: showing one does not hide the others.
+//! Named specials from the `[special]` config section get their own slot IDs
+//! past the numbered range (see `cosmic_comp_config::special`), so toggling
+//! a named special never disturbs a numbered one. A config without that
+//! section produces the exact built-in behavior: twelve numbered slots, no
+//! named slots, no geometry overrides.
 //!
 //! Special state lives in RAM only: a compositor restart forgets which
 //! windows were parked and unconditionally re-maps them on their original
 //! workspaces. That is a documented limitation, not a crash path.
 
 use calloop::LoopHandle;
+use cosmic_comp_config::special::{SPECIAL_NUMBERED_SLOTS, SpecialAnchor, SpecialConfig};
 use smithay::input::Seat;
 use smithay::output::Output;
 use smithay::utils::IsAlive;
@@ -164,11 +170,30 @@ impl PartialEq<CosmicMapped> for SpecialWindow {
     }
 }
 
+/// Placement hint for a special slot, straight from the config. `None`
+/// sizes mean the compositor's automatic floating placement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpecialGeometry {
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub anchor: SpecialAnchor,
+}
+
 #[derive(Default)]
 pub struct SpecialWorkspaceManager {
     /// Numbered special workspaces, grown on demand so `special 7` can exist
-    /// without materializing 1..6 first.
+    /// without materializing 1..6 first. Slots `0..SPECIAL_NUMBERED_SLOTS`
+    /// are the fixed numbered specials; slots at or after the offset belong
+    /// to named specials, in the registry order of `named`.
     specials: Vec<SpecialStore<SpecialWindow>>,
+    /// Named special registry; position in this vec plus the numbered
+    /// offset is the slot ID (mirrors `SpecialConfig::slot_for_name`).
+    named: Vec<String>,
+    /// Placement hint per slot. Written from the config; consumed by
+    /// floating-layer placement in a later iteration (the attach path still
+    /// uses automatic placement).
+    #[allow(dead_code)]
+    geometry: std::collections::HashMap<usize, SpecialGeometry>,
 }
 
 impl std::fmt::Debug for SpecialWorkspaceManager {
@@ -187,6 +212,68 @@ impl std::fmt::Debug for SpecialWorkspaceManager {
 }
 
 impl SpecialWorkspaceManager {
+    /// Build a manager pre-seeded from the `[special]` config section. An
+    /// absent/default section yields exactly the built-in numbered behavior.
+    pub fn from_config(config: &SpecialConfig) -> Self {
+        let mut manager = Self::default();
+        manager.apply_config(config);
+        manager
+    }
+
+    /// Re-seed the named registry and geometry hints from the config.
+    ///
+    /// Already-parked windows are left where they are: slots are identity
+    /// (numbered stay numbered, named keep their slot as long as the name
+    /// survives a reload), so a config change never dumps windows onto the
+    /// user's workspace. A name removed from the config orphans its slot —
+    /// its windows stay parked until reassigned or closed.
+    pub fn apply_config(&mut self, config: &SpecialConfig) {
+        self.named = config.named.keys().cloned().collect();
+        self.geometry.clear();
+        for idx in 0..SPECIAL_NUMBERED_SLOTS {
+            self.geometry.insert(
+                idx,
+                SpecialGeometry {
+                    width: config.numbered.width,
+                    height: config.numbered.height,
+                    anchor: config.numbered.anchor,
+                },
+            );
+        }
+        for (name, named) in &config.named {
+            if let Some(idx) = config.slot_for_name(name) {
+                self.geometry.insert(
+                    idx,
+                    SpecialGeometry {
+                        width: named.width,
+                        height: named.height,
+                        anchor: named.anchor,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Slot ID for a named special, if the name is configured.
+    pub fn slot_for_name(&self, name: &str) -> Option<usize> {
+        self.named
+            .iter()
+            .position(|n| n == name)
+            .map(|idx| SPECIAL_NUMBERED_SLOTS + idx)
+    }
+
+    /// The configured placement hint for a slot, if any.
+    #[allow(dead_code)]
+    pub fn geometry_for(&self, slot: usize) -> Option<SpecialGeometry> {
+        self.geometry.get(&slot).copied()
+    }
+
+    /// The configured named specials, in slot order.
+    #[allow(dead_code)]
+    pub fn named_specials(&self) -> &[String] {
+        &self.named
+    }
+
     fn slot_mut(&mut self, idx: usize) -> &mut SpecialStore<SpecialWindow> {
         while self.specials.len() <= idx {
             self.specials.push(SpecialStore::default());
@@ -387,6 +474,44 @@ impl Shell {
             return focus;
         }
         self.special_focus_candidate(seat, &output)
+    }
+
+    /// Named-special variants of the toggle/send primitives. They resolve
+    /// the configured name to its slot (offset past the numbered range) and
+    /// otherwise behave exactly like the numbered path — a named and a
+    /// numbered special can be shown at the same time. Unknown names are
+    /// ignored (logged), they have no slot.
+    // No keybind path dispatches names yet; exposed for the follow-up wave.
+    #[allow(dead_code)]
+    pub fn special_toggle_named(
+        &mut self,
+        seat: &Seat<State>,
+        name: &str,
+        loop_handle: &LoopHandle<'static, State>,
+    ) -> Option<KeyboardFocusTarget> {
+        match self.special.slot_for_name(name) {
+            Some(idx) => self.special_toggle(seat, idx, loop_handle),
+            None => {
+                debug!(special = name, "toggle for unconfigured named special");
+                None
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn special_send_current_named(
+        &mut self,
+        seat: &Seat<State>,
+        name: &str,
+        loop_handle: &LoopHandle<'static, State>,
+    ) -> Option<KeyboardFocusTarget> {
+        match self.special.slot_for_name(name) {
+            Some(idx) => self.special_send_current(seat, idx, loop_handle),
+            None => {
+                debug!(special = name, "send to unconfigured named special");
+                None
+            }
+        }
     }
 
     /// Re-attach shown special windows to the newly activated workspace: a
@@ -599,7 +724,102 @@ fn mru_focus_excluding<'a, T>(
 
 #[cfg(test)]
 mod tests {
-    use super::{SpecialStore, mru_focus_excluding};
+    use super::{SpecialGeometry, SpecialStore, SpecialWorkspaceManager, mru_focus_excluding};
+    use cosmic_comp_config::special::{
+        NumberedSpecialsConfig, SPECIAL_NUMBERED_SLOTS, SpecialAnchor, SpecialConfig,
+    };
+    use std::collections::BTreeMap;
+
+    /// Manager built from an absent/default `[special]` section: no named
+    /// slots, default geometry — the built-in numbered behavior, unchanged.
+    #[test]
+    fn default_config_changes_nothing() {
+        let manager = SpecialWorkspaceManager::from_config(&SpecialConfig::default());
+        assert!(manager.named_specials().is_empty());
+        assert_eq!(manager.slot_for_name("anything"), None);
+        assert_eq!(
+            manager.geometry_for(0),
+            Some(SpecialGeometry {
+                width: None,
+                height: None,
+                anchor: SpecialAnchor::Center,
+            })
+        );
+    }
+
+    #[test]
+    fn named_specials_resolve_to_slots_past_the_numbered_range() {
+        let mut config = SpecialConfig::default();
+        config
+            .named
+            .insert("terminal".to_string(), Default::default());
+        config.named.insert("notes".to_string(), Default::default());
+        let manager = SpecialWorkspaceManager::from_config(&config);
+        assert_eq!(manager.slot_for_name("notes"), Some(SPECIAL_NUMBERED_SLOTS));
+        assert_eq!(
+            manager.slot_for_name("terminal"),
+            Some(SPECIAL_NUMBERED_SLOTS + 1)
+        );
+        assert_eq!(manager.slot_for_name("unknown"), None);
+    }
+
+    #[test]
+    fn named_geometry_is_independent_from_numbered_geometry() {
+        let mut config = SpecialConfig::default();
+        config.numbered = NumberedSpecialsConfig {
+            width: Some(800),
+            height: None,
+            anchor: SpecialAnchor::Top,
+        };
+        config.named.insert(
+            "terminal".to_string(),
+            cosmic_comp_config::special::NamedSpecialConfig {
+                width: Some(1000),
+                height: Some(400),
+                anchor: SpecialAnchor::Bottom,
+                on_demand: true,
+            },
+        );
+        let manager = SpecialWorkspaceManager::from_config(&config);
+        assert_eq!(
+            manager.geometry_for(0),
+            Some(SpecialGeometry {
+                width: Some(800),
+                height: None,
+                anchor: SpecialAnchor::Top,
+            })
+        );
+        assert_eq!(
+            manager.geometry_for(SPECIAL_NUMBERED_SLOTS),
+            Some(SpecialGeometry {
+                width: Some(1000),
+                height: Some(400),
+                anchor: SpecialAnchor::Bottom,
+            })
+        );
+    }
+
+    /// Slot identity survives a config reload as long as the name does, so
+    /// re-applying the same section must not reshuffle named specials.
+    #[test]
+    fn apply_config_keeps_slot_stability_across_reloads() {
+        let mut config = SpecialConfig {
+            named: BTreeMap::new(),
+            ..Default::default()
+        };
+        config.named.insert("a".to_string(), Default::default());
+        config.named.insert("b".to_string(), Default::default());
+        let mut manager = SpecialWorkspaceManager::from_config(&config);
+        let slot_a = manager.slot_for_name("a");
+        manager.apply_config(&config);
+        assert_eq!(manager.slot_for_name("a"), slot_a);
+        // A name dropped from the config loses its slot mapping, but the
+        // other named specials keep theirs.
+        config.named.remove("a");
+        manager.apply_config(&config);
+        assert_eq!(manager.slot_for_name("a"), None);
+        assert_eq!(manager.slot_for_name("b"), Some(SPECIAL_NUMBERED_SLOTS));
+    }
 
     #[test]
     fn toggle_hidden_special_makes_it_visible() {

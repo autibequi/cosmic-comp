@@ -1729,7 +1729,7 @@ impl Shell {
         Shell {
             workspaces: Workspaces::new(config, theme.clone()),
             seats: Seats::new(),
-            special: SpecialWorkspaceManager::default(),
+            special: SpecialWorkspaceManager::from_config(&config.cosmic_conf.special),
 
             pending_windows: Vec::new(),
             pending_layers: Vec::new(),
