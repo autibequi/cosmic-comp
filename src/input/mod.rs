@@ -78,7 +78,7 @@ use smithay::{
         seat::WaylandFocus,
     },
 };
-use tracing::{error, trace};
+use tracing::{debug, error, trace};
 use xkbcommon::xkb::{Keycode, Keysym};
 
 use std::{
@@ -2478,6 +2478,56 @@ impl State {
                     modifiers: shortcuts::Modifiers::default(),
                     keycode: None,
                     key: Some(Keysym::Escape),
+                    description: None,
+                },
+            )));
+        }
+
+        // Internal default bindings for the special workspace actions. A
+        // user-facing binding requires a `shortcuts::Action` variant
+        // (cosmic-settings-config); until that exists these mirror the
+        // internal Escape handling above.
+        //
+        // Toggle: logo+F1..F12 -> special 1..12. Send: logo+shift+F1..F12.
+        // The F1..F12 keysyms are consecutive, so the special number falls
+        // straight out of the keysym value.
+        let raw = handle.modified_sym().raw();
+        let special_num = if (Keysym::F1.raw()..=Keysym::F12.raw()).contains(&raw) {
+            (raw - Keysym::F1.raw() + 1) as u8
+        } else {
+            0
+        };
+        if special_num > 0 && key_state == KeyState::Pressed {
+            debug!(
+                ?modifiers,
+                special = special_num,
+                "F-key pressed — checking special workspace chords"
+            );
+        }
+        let usable = special_num > 0
+            && key_state == KeyState::Pressed
+            && modifiers.logo
+            && !modifiers.ctrl
+            && !modifiers.alt;
+        let toggle_special = usable && !modifiers.shift;
+        let send_special = usable && modifiers.shift;
+        if toggle_special || send_special {
+            let (action, shift) = if send_special {
+                (PrivateAction::SendToSpecial(special_num), true)
+            } else {
+                (PrivateAction::ToggleSpecial(special_num), false)
+            };
+            seat.supressed_keys().add(backend_id, &handle, None);
+            return FilterResult::Intercept(Some((
+                Action::Private(action),
+                shortcuts::Binding {
+                    modifiers: shortcuts::Modifiers {
+                        logo: true,
+                        shift,
+                        ..Default::default()
+                    },
+                    keycode: None,
+                    key: Some(handle.modified_sym()),
                     description: None,
                 },
             )));
