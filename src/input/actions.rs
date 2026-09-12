@@ -110,6 +110,20 @@ impl State {
                         .finish_resize(direction, edge.into());
                 }
             }
+
+            Action::Private(PrivateAction::ToggleSpecial) => {
+                let target = self.common.shell.write().special_toggle(seat);
+                if let Some(target) = target {
+                    Shell::set_focus(self, Some(&target), seat, Some(serial), true);
+                }
+            }
+
+            Action::Private(PrivateAction::SendToSpecial) => {
+                let target = self.common.shell.write().special_send_current(seat);
+                if let Some(target) = target {
+                    Shell::set_focus(self, Some(&target), seat, Some(serial), true);
+                }
+            }
         }
     }
 

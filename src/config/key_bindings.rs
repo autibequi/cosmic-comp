@@ -19,6 +19,8 @@ pub enum PrivateAction {
         shortcuts::action::ResizeEdge,
         shortcuts::State,
     ),
+    ToggleSpecial,
+    SendToSpecial,
 }
 
 /// Convert `cosmic_settings_config::shortcuts::State` to `smithay::backend::input::KeyState`.

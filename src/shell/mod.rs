@@ -101,12 +101,14 @@ pub mod focus;
 pub mod grabs;
 pub mod layout;
 mod seats;
+mod special;
 mod workspace;
 pub mod zoom;
 pub use self::element::{CosmicMapped, CosmicMappedRenderElement, CosmicSurface};
 pub use self::seats::*;
 pub use self::workspace::*;
 use self::zoom::{OutputZoomState, ZoomState};
+use special::SpecialWorkspaceManager;
 
 use self::{
     element::{
@@ -285,6 +287,7 @@ pub struct Shell {
     pub override_redirect_windows: Vec<X11Surface>,
     pub session_lock: Option<SessionLock>,
     pub seats: Seats,
+    pub(crate) special: SpecialWorkspaceManager,
     pub previous_workspace_idx: Option<(Serial, WeakOutput, usize)>,
     pub xwayland_keyboard_grab: Option<XWaylandKeyboardGrab<State>>,
 
@@ -1726,6 +1729,7 @@ impl Shell {
         Shell {
             workspaces: Workspaces::new(config, theme.clone()),
             seats: Seats::new(),
+            special: SpecialWorkspaceManager::default(),
 
             pending_windows: Vec::new(),
             pending_layers: Vec::new(),
@@ -1768,6 +1772,7 @@ impl Shell {
                         set.workspaces[set.active].tiling_layer.cleanup_drag();
                     }
                     set.activate(idx, workspace_delta, workspace_state)?;
+                    self.special_follow(output);
 
                     let output_geo = output.geometry();
                     Ok(

@@ -78,7 +78,7 @@ use smithay::{
         seat::WaylandFocus,
     },
 };
-use tracing::{error, trace};
+use tracing::{debug, error, trace};
 use xkbcommon::xkb::{Keycode, Keysym};
 
 use std::{
@@ -2478,6 +2478,50 @@ impl State {
                     modifiers: shortcuts::Modifiers::default(),
                     keycode: None,
                     key: Some(Keysym::Escape),
+                    description: None,
+                },
+            )));
+        }
+
+        // Internal default bindings for the special workspace actions. A
+        // user-facing binding requires a `shortcuts::Action` variant
+        // (cosmic-settings-config); until that exists these mirror the
+        // internal Escape handling above.
+        //
+        // Toggle: logo+F1. Send: logo+shift+F1.
+        let special_sym = handle.modified_sym() == Keysym::F1;
+        if special_sym && key_state == KeyState::Pressed {
+            debug!(?modifiers, "F1 pressed — checking special workspace chords");
+        }
+        let toggle_special = special_sym
+            && key_state == KeyState::Pressed
+            && modifiers.logo
+            && !modifiers.ctrl
+            && !modifiers.shift
+            && !modifiers.alt;
+        let send_special = special_sym
+            && key_state == KeyState::Pressed
+            && modifiers.logo
+            && modifiers.shift
+            && !modifiers.ctrl
+            && !modifiers.alt;
+        if toggle_special || send_special {
+            let (action, shift) = if send_special {
+                (PrivateAction::SendToSpecial, true)
+            } else {
+                (PrivateAction::ToggleSpecial, false)
+            };
+            seat.supressed_keys().add(backend_id, &handle, None);
+            return FilterResult::Intercept(Some((
+                Action::Private(action),
+                shortcuts::Binding {
+                    modifiers: shortcuts::Modifiers {
+                        logo: true,
+                        shift,
+                        ..Default::default()
+                    },
+                    keycode: None,
+                    key: Some(Keysym::F1),
                     description: None,
                 },
             )));
