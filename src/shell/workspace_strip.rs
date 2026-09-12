@@ -12,6 +12,9 @@
 //! tested in isolation. Today every column has the width of the output; the
 //! `ColumnGeometry` abstraction keeps the door open for per-column widths.
 
+use std::time::{Duration, Instant};
+
+use keyframe::{ease, functions::EaseInOutCubic};
 use smithay::utils::{Logical, Point, Size};
 
 /// Position and width of one workspace column on the horizontal strip.
@@ -170,6 +173,81 @@ pub fn default_viewport(output_size: Size<i32, Logical>) -> Point<i32, Logical> 
     Point::from((viewport_offset_for_index(0, output_size.w), 0))
 }
 
+/// Pure pan animation of the strip viewport offset between two columns.
+///
+/// Time-based and side-effect free: the animation state only answers
+/// "what is the offset at time `now`". The logical `active` workspace has
+/// already changed by the time the animation starts — the pan merely makes
+/// the visual offset catch up. Retargeting always continues from the
+/// current *visual* offset (`value(now)`), never from a previous target, so
+/// rapid successive inputs compose without corrupting the state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PanAnimation {
+    from: f64,
+    to: f64,
+    start: Instant,
+    duration: Duration,
+    bounds: (f64, f64),
+}
+
+impl PanAnimation {
+    /// Animate the offset from `from` to the target of column `index`,
+    /// clamped to the strip of `count` columns of `width`.
+    pub fn new(
+        from: f64,
+        index: usize,
+        count: usize,
+        width: i32,
+        duration: Duration,
+        now: Instant,
+    ) -> Self {
+        let to = StripState::clamp_offset(StripState::target_offset(index, width), count, width);
+        Self {
+            from,
+            to,
+            start: now,
+            duration,
+            bounds: (0.0, StripState::max_offset(count, width)),
+        }
+    }
+
+    /// Retarget the pan to column `index`, continuing from the offset the
+    /// animation has visually reached at `now`. Callers must apply the
+    /// retargeted animation; the old one is superseded (no state is shared).
+    pub fn retarget(
+        &self,
+        index: usize,
+        count: usize,
+        width: i32,
+        duration: Duration,
+        now: Instant,
+    ) -> Self {
+        Self::new(self.value(now), index, count, width, duration, now)
+    }
+
+    /// Visual offset of the viewport at `now`, eased and clamped to the
+    /// strip bounds. Always converges to `to` once `now >= start + duration`.
+    pub fn value(&self, now: Instant) -> f64 {
+        let progress = (now.saturating_duration_since(self.start).as_secs_f64()
+            / self.duration.as_secs_f64())
+        .clamp(0.0, 1.0);
+        let eased = ease(EaseInOutCubic, 0.0, 1.0, progress as f32) as f64;
+        let value = self.from + (self.to - self.from) * eased;
+        value.clamp(self.bounds.0, self.bounds.1)
+    }
+
+    /// Whether the animation has converged to its target at `now`. A pan with
+    /// no distance to cover (already on target) is done immediately.
+    pub fn is_done(&self, now: Instant) -> bool {
+        self.from == self.to || now.saturating_duration_since(self.start) >= self.duration
+    }
+
+    /// Final offset the animation converges to.
+    pub fn target(&self) -> f64 {
+        self.to
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,5 +402,78 @@ mod tests {
     #[test]
     fn default_viewport_is_first_column() {
         assert_eq!(default_viewport(Size::from((W, 1080))), Point::from((0, 0)));
+    }
+
+    mod pan {
+        use std::time::Duration;
+
+        use super::*;
+
+        const DUR: Duration = Duration::from_millis(200);
+        const COUNT: usize = 5;
+
+        #[test]
+        fn identity_when_already_on_target() {
+            let start = Instant::now();
+            let anim = PanAnimation::new(2.0 * W as f64, 2, COUNT, W, DUR, start);
+            assert!(anim.is_done(start));
+            assert_eq!(anim.value(start), 2.0 * W as f64);
+            assert_eq!(anim.target(), 2.0 * W as f64);
+        }
+
+        #[test]
+        fn converges_to_target() {
+            let start = Instant::now();
+            let anim = PanAnimation::new(0.0, 3, COUNT, W, DUR, start);
+            assert!(!anim.is_done(start));
+            assert_eq!(anim.value(start), 0.0, "starts at `from`");
+            let mid = anim.value(start + DUR / 2);
+            assert!(mid > 0.0 && mid < 3.0 * W as f64, "mid={mid}");
+            assert!(anim.is_done(start + DUR));
+            assert_eq!(anim.value(start + DUR), 3.0 * W as f64);
+            assert_eq!(anim.value(start + 2 * DUR), 3.0 * W as f64);
+        }
+
+        #[test]
+        fn retarget_continues_from_current_offset() {
+            let start = Instant::now();
+            let anim = PanAnimation::new(0.0, 3, COUNT, W, DUR, start);
+            let now = start + DUR / 2;
+            let current = anim.value(now);
+            // Reverse direction mid-flight towards column 0.
+            let retargeted = anim.retarget(0, COUNT, W, DUR, now);
+            assert_eq!(retargeted.value(now), current);
+            assert_eq!(retargeted.target(), 0.0);
+            assert!(!retargeted.is_done(now));
+            assert_eq!(retargeted.value(now + DUR), 0.0);
+        }
+
+        #[test]
+        fn retarget_from_finished_animation_is_identity() {
+            let start = Instant::now();
+            let anim = PanAnimation::new(0.0, 2, COUNT, W, DUR, start);
+            let now = start + 2 * DUR;
+            let retargeted = anim.retarget(2, COUNT, W, DUR, now);
+            assert!(retargeted.is_done(now));
+            assert_eq!(retargeted.value(now), anim.value(now));
+        }
+
+        #[test]
+        fn value_is_clamped_to_strip_bounds() {
+            let start = Instant::now();
+            let max = StripState::max_offset(COUNT, W);
+            // Target clamped when the index is past the last column.
+            let anim = PanAnimation::new(0.0, 42, COUNT, W, DUR, start);
+            assert_eq!(anim.target(), max);
+            for i in 0..=10u32 {
+                let t = start + DUR * i / 10;
+                let v = anim.value(t);
+                assert!((0.0..=max).contains(&v), "t={t:?} v={v}");
+            }
+            // A single-column strip always clamps to 0.
+            let anim = PanAnimation::new(1.5 * W as f64, 0, 1, W, DUR, start);
+            assert_eq!(anim.target(), 0.0);
+            assert_eq!(anim.value(start + DUR), 0.0);
+        }
     }
 }

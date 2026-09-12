@@ -374,6 +374,9 @@ pub struct WorkspaceSet {
     /// Continuous viewport offset of the workspace strip. Purely spatial state
     /// derived from `active`; see [`workspace_strip::StripState`].
     strip_offset: f64,
+    /// Pan animation driving `strip_offset` towards the target of `active`.
+    /// Purely visual: `active` has already changed when this starts.
+    strip_anim: Option<workspace_strip::PanAnimation>,
     pub group: WorkspaceGroupHandle,
     tiling_enabled: bool,
     output: Output,
@@ -530,6 +533,7 @@ impl WorkspaceSet {
             previously_active: None,
             active: 0,
             strip_offset: workspace_strip::StripState::default().offset,
+            strip_anim: None,
             group: group_handle,
             tiling_enabled,
             theme: theme.clone(),
@@ -541,19 +545,26 @@ impl WorkspaceSet {
         }
     }
 
-    fn activate(
+    /// The single entry point that changes the active workspace together with
+    /// the strip target offset. Keyboard navigation, the discrete swipe
+    /// gesture and programmatic activation all funnel through here: the
+    /// logical state (`active`) changes immediately and the pan animation
+    /// only makes the visual offset catch up.
+    fn scroll_to_workspace(
         &mut self,
         idx: usize,
         workspace_delta: WorkspaceDelta,
         state: &mut WorkspaceUpdateGuard<'_, State>,
+        animate_strip: bool,
     ) -> Result<bool, InvalidWorkspaceIndex> {
         if idx >= self.workspaces.len() {
             return Err(InvalidWorkspaceIndex);
         }
 
-        // Animate if workspaces overview isn't open
-        let layer_map = layer_map_for_output(&self.output);
-        let animate = !layer_map
+        // Animate if workspaces overview isn't open. The flag is computed
+        // from a temporary guard so the layer map borrow of `self.output` is
+        // released before the state below is mutated.
+        let animate = !layer_map_for_output(&self.output)
             .layers()
             .any(|l| l.namespace() == WORKSPACE_OVERVIEW_NAMESPACE);
 
@@ -569,9 +580,9 @@ impl WorkspaceSet {
                 None
             };
             self.active = idx;
-            // Assignment after the immutable borrow; keeps the `layer_map`
-            // guard borrow of `self.output` non-conflicting.
-            self.strip_offset = self.snapped_strip_offset();
+            // The logical state changed above; the pan animation only makes
+            // the visual offset catch up to the new target.
+            self.start_strip_pan(animate && animate_strip);
             Ok(true)
         } else {
             // snap to workspace, when in between workspaces due to swipe gesture
@@ -589,13 +600,67 @@ impl WorkspaceSet {
         }
     }
 
+    /// Re-point the strip pan at the target of the current `active` index.
+    ///
+    /// Retargeting mid-flight continues from the offset the animation has
+    /// visually reached right now (never from the superseded target), so
+    /// rapid successive inputs stay smooth and the offset stays clamped to
+    /// the strip bounds. Without animation the offset snaps directly.
+    fn start_strip_pan(&mut self, animate: bool) {
+        if !animate {
+            self.strip_anim = None;
+            self.strip_offset = self.snapped_strip_offset();
+            return;
+        }
+        let now = Instant::now();
+        let width = self.strip_column_width();
+        let count = self.workspaces.len();
+        let from = self
+            .strip_anim
+            .take()
+            .map_or(self.strip_offset, |anim| anim.value(now));
+        self.strip_offset = from;
+        let target = workspace_strip::StripState::clamp_offset(
+            workspace_strip::StripState::target_offset(self.active, width),
+            count,
+            width,
+        );
+        self.strip_anim = if (target - from).abs() > f64::EPSILON {
+            Some(workspace_strip::PanAnimation::new(
+                from,
+                self.active,
+                count,
+                width,
+                ANIMATION_DURATION,
+                now,
+            ))
+        } else {
+            None
+        };
+    }
+
+    /// Advance the strip pan to `now`, applying the visual offset for this
+    /// frame and dropping the animation once it converged.
+    fn update_strip_offset(&mut self) {
+        let now = Instant::now();
+        if let Some(anim) = self.strip_anim.take() {
+            if anim.is_done(now) {
+                self.strip_offset = anim.target();
+            } else {
+                self.strip_offset = anim.value(now);
+                self.strip_anim = Some(anim);
+            }
+        }
+    }
+
     fn activate_previous(
         &mut self,
         workspace_delta: WorkspaceDelta,
         state: &mut WorkspaceUpdateGuard<'_, State>,
+        animate_strip: bool,
     ) -> Result<bool, InvalidWorkspaceIndex> {
         if let Some((idx, _)) = self.previously_active {
-            return self.activate(idx, workspace_delta, state);
+            return self.scroll_to_workspace(idx, workspace_delta, state, animate_strip);
         }
         Err(InvalidWorkspaceIndex)
     }
@@ -755,7 +820,9 @@ impl WorkspaceSet {
                 idx
             });
         // Keep the strip viewport on the same logical column after the
-        // removal reshuffled indices.
+        // removal reshuffled indices. Any running pan targeted the old
+        // strip, so it is superseded by the snap.
+        self.strip_anim = None;
         self.strip_offset = self.snapped_strip_offset();
     }
 
@@ -1782,6 +1849,19 @@ impl Shell {
         }
     }
 
+    /// Unified workspace switch for keyboard navigation, the discrete swipe
+    /// gesture and programmatic activation: the logical `active` workspace
+    /// changes immediately and the strip pan animation only follows. See
+    /// `WorkspaceSet::scroll_to_workspace`.
+    pub fn scroll_to_workspace(
+        &mut self,
+        output: &Output,
+        idx: usize,
+        workspace_state: &mut WorkspaceUpdateGuard<'_, State>,
+    ) -> Result<Point<i32, Global>, InvalidWorkspaceIndex> {
+        self.activate(output, idx, WorkspaceDelta::new_shortcut(), workspace_state)
+    }
+
     pub fn activate(
         &mut self,
         output: &Output,
@@ -1789,6 +1869,7 @@ impl Shell {
         workspace_delta: WorkspaceDelta,
         workspace_state: &mut WorkspaceUpdateGuard<'_, State>,
     ) -> Result<Point<i32, Global>, InvalidWorkspaceIndex> {
+        let animate_strip = matches!(self.workspaces.layout, WorkspaceLayout::Scrolling);
         match &mut self.workspaces.mode {
             WorkspaceMode::OutputBound => {
                 if let Some(set) = self.workspaces.sets.get_mut(output) {
@@ -1798,7 +1879,7 @@ impl Shell {
                     ) {
                         set.workspaces[set.active].tiling_layer.cleanup_drag();
                     }
-                    set.activate(idx, workspace_delta, workspace_state)?;
+                    set.scroll_to_workspace(idx, workspace_delta, workspace_state, animate_strip)?;
 
                     let output_geo = output.geometry();
                     Ok(
@@ -1811,7 +1892,7 @@ impl Shell {
             }
             WorkspaceMode::Global => {
                 for set in self.workspaces.sets.values_mut() {
-                    set.activate(idx, workspace_delta, workspace_state)?;
+                    set.scroll_to_workspace(idx, workspace_delta, workspace_state, animate_strip)?;
                 }
                 let output_geo = output.geometry();
                 Ok(output_geo.loc + Point::from((output_geo.size.w / 2, output_geo.size.h / 2)))
@@ -1840,6 +1921,7 @@ impl Shell {
         velocity: f64,
         workspace_state: &mut WorkspaceUpdateGuard<'_, State>,
     ) -> Result<Point<i32, Global>, InvalidWorkspaceIndex> {
+        let animate_strip = matches!(self.workspaces.layout, WorkspaceLayout::Scrolling);
         match &mut self.workspaces.mode {
             WorkspaceMode::OutputBound => {
                 if let Some(set) = self.workspaces.sets.get_mut(output) {
@@ -1861,7 +1943,7 @@ impl Shell {
                             || (velocity.abs() < GESTURE_VELOCITY_THRESHOLD
                                 && delta.abs() > GESTURE_POSITION_THRESHOLD)
                         {
-                            set.activate(
+                            set.scroll_to_workspace(
                                 set.active,
                                 WorkspaceDelta::new_gesture_end(
                                     delta.abs(),
@@ -1869,6 +1951,7 @@ impl Shell {
                                     forward,
                                 ),
                                 workspace_state,
+                                animate_strip,
                             )?;
                         } else {
                             set.activate_previous(
@@ -1878,6 +1961,7 @@ impl Shell {
                                     !forward,
                                 ),
                                 workspace_state,
+                                animate_strip,
                             )?;
                         }
                     }
@@ -1905,7 +1989,7 @@ impl Shell {
                             || (velocity.abs() < GESTURE_VELOCITY_THRESHOLD
                                 && delta.abs() > GESTURE_POSITION_THRESHOLD)
                         {
-                            set.activate(
+                            set.scroll_to_workspace(
                                 set.active,
                                 WorkspaceDelta::new_gesture_end(
                                     delta.abs(),
@@ -1913,6 +1997,7 @@ impl Shell {
                                     forward,
                                 ),
                                 workspace_state,
+                                animate_strip,
                             )?;
                         } else {
                             set.activate_previous(
@@ -1922,6 +2007,7 @@ impl Shell {
                                     !forward,
                                 ),
                                 workspace_state,
+                                animate_strip,
                             )?;
                         }
                     }
@@ -2346,6 +2432,7 @@ impl Shell {
             set.previously_active
                 .as_ref()
                 .is_some_and(|(_, delta)| delta.is_animating())
+                || set.strip_anim.is_some()
                 || set.sticky_layer.animations_going()
         }) || !matches!(
             self.overview_mode,
@@ -2375,6 +2462,7 @@ impl Shell {
         let mut clients = HashMap::new();
         for set in self.workspaces.sets.values_mut() {
             set.sticky_layer.update_animation_state();
+            set.update_strip_offset();
         }
         for workspace in self.workspaces.spaces_mut() {
             clients.extend(workspace.update_animations());
