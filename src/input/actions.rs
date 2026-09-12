@@ -215,8 +215,10 @@ impl State {
                         && self.common.config.cosmic_conf.workspaces.workspace_layout
                             == WorkspaceLayout::Vertical)
                         || ((direction == Direction::Up || direction == Direction::Down)
-                            && self.common.config.cosmic_conf.workspaces.workspace_layout
-                                == WorkspaceLayout::Horizontal))
+                            && matches!(
+                                self.common.config.cosmic_conf.workspaces.workspace_layout,
+                                WorkspaceLayout::Horizontal | WorkspaceLayout::Scrolling
+                            )))
                 {
                     return;
                 }
@@ -255,8 +257,10 @@ impl State {
                         && self.common.config.cosmic_conf.workspaces.workspace_layout
                             == WorkspaceLayout::Vertical)
                         || ((direction == Direction::Up || direction == Direction::Down)
-                            && self.common.config.cosmic_conf.workspaces.workspace_layout
-                                == WorkspaceLayout::Horizontal))
+                            && matches!(
+                                self.common.config.cosmic_conf.workspaces.workspace_layout,
+                                WorkspaceLayout::Horizontal | WorkspaceLayout::Scrolling
+                            )))
                 {
                     return;
                 }
@@ -351,8 +355,10 @@ impl State {
                         && self.common.config.cosmic_conf.workspaces.workspace_layout
                             == WorkspaceLayout::Vertical)
                         || ((direction == Direction::Up || direction == Direction::Down)
-                            && self.common.config.cosmic_conf.workspaces.workspace_layout
-                                == WorkspaceLayout::Horizontal))
+                            && matches!(
+                                self.common.config.cosmic_conf.workspaces.workspace_layout,
+                                WorkspaceLayout::Horizontal | WorkspaceLayout::Scrolling
+                            )))
                 {
                     return;
                 }
@@ -445,8 +451,10 @@ impl State {
                         && self.common.config.cosmic_conf.workspaces.workspace_layout
                             == WorkspaceLayout::Vertical)
                         || ((direction == Direction::Up || direction == Direction::Down)
-                            && self.common.config.cosmic_conf.workspaces.workspace_layout
-                                == WorkspaceLayout::Horizontal))
+                            && matches!(
+                                self.common.config.cosmic_conf.workspaces.workspace_layout,
+                                WorkspaceLayout::Horizontal | WorkspaceLayout::Scrolling
+                            )))
                 {
                     return;
                 }
@@ -780,10 +788,12 @@ impl State {
                                 self.common.config.cosmic_conf.workspaces.workspace_layout,
                             ) {
                                 (Direction::Left, WorkspaceLayout::Horizontal)
+                                | (Direction::Left, WorkspaceLayout::Scrolling)
                                 | (Direction::Up, WorkspaceLayout::Vertical) => {
                                     Action::PreviousWorkspace
                                 }
                                 (Direction::Right, WorkspaceLayout::Horizontal)
+                                | (Direction::Right, WorkspaceLayout::Scrolling)
                                 | (Direction::Down, WorkspaceLayout::Vertical) => {
                                     Action::NextWorkspace
                                 }
@@ -839,10 +849,12 @@ impl State {
                             self.common.config.cosmic_conf.workspaces.workspace_layout,
                         ) {
                             (Direction::Left, WorkspaceLayout::Horizontal)
+                            | (Direction::Left, WorkspaceLayout::Scrolling)
                             | (Direction::Up, WorkspaceLayout::Vertical) => {
                                 Action::MoveToPreviousWorkspace
                             }
                             (Direction::Right, WorkspaceLayout::Horizontal)
+                            | (Direction::Right, WorkspaceLayout::Scrolling)
                             | (Direction::Down, WorkspaceLayout::Vertical) => {
                                 Action::MoveToNextWorkspace
                             }

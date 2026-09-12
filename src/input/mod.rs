@@ -1195,9 +1195,10 @@ impl State {
                             activate_action = match gesture_state.fingers {
                                 3 => None, // TODO: 3 finger gestures
                                 4 => {
-                                    if self.common.config.cosmic_conf.workspaces.workspace_layout
-                                        == WorkspaceLayout::Horizontal
-                                    {
+                                    if matches!(
+                                        self.common.config.cosmic_conf.workspaces.workspace_layout,
+                                        WorkspaceLayout::Horizontal | WorkspaceLayout::Scrolling
+                                    ) {
                                         match gesture_state.direction {
                                             Some(Direction::Left) => {
                                                 if natural_scroll {
@@ -1282,14 +1283,14 @@ impl State {
                         match gesture_state.action {
                             Some(SwipeAction::NextWorkspace) | Some(SwipeAction::PrevWorkspace) => {
                                 let velocity = gesture_state.velocity();
-                                let norm_velocity =
-                                    if self.common.config.cosmic_conf.workspaces.workspace_layout
-                                        == WorkspaceLayout::Horizontal
-                                    {
-                                        velocity / seat.active_output().geometry().size.w as f64
-                                    } else {
-                                        velocity / seat.active_output().geometry().size.h as f64
-                                    };
+                                let norm_velocity = if matches!(
+                                    self.common.config.cosmic_conf.workspaces.workspace_layout,
+                                    WorkspaceLayout::Horizontal | WorkspaceLayout::Scrolling
+                                ) {
+                                    velocity / seat.active_output().geometry().size.w as f64
+                                } else {
+                                    velocity / seat.active_output().geometry().size.h as f64
+                                };
                                 let _ = self.common.shell.write().end_workspace_swipe(
                                     &seat.active_output(),
                                     norm_velocity,

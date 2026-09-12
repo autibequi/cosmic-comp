@@ -102,6 +102,7 @@ pub mod grabs;
 pub mod layout;
 mod seats;
 mod workspace;
+pub mod workspace_strip;
 pub mod zoom;
 pub use self::element::{CosmicMapped, CosmicMappedRenderElement, CosmicSurface};
 pub use self::seats::*;

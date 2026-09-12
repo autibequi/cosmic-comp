@@ -42,6 +42,62 @@ pub enum WorkspaceLayout {
     #[default]
     Vertical,
     Horizontal,
+    /// Workspaces are arranged as an horizontal strip of columns; switching
+    /// workspaces pans the viewport to the column at index * output width.
+    Scrolling,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WorkspaceLayout;
+    use crate::workspace::WorkspaceConfig;
+
+    #[test]
+    fn layout_deserializes_new_variant() {
+        let layout: WorkspaceLayout = serde_json::from_str(r#""Scrolling""#).unwrap();
+        assert_eq!(layout, WorkspaceLayout::Scrolling);
+    }
+
+    #[test]
+    fn layout_deserializes_legacy_variants() {
+        assert_eq!(
+            serde_json::from_str::<WorkspaceLayout>(r#""Vertical""#).unwrap(),
+            WorkspaceLayout::Vertical
+        );
+        assert_eq!(
+            serde_json::from_str::<WorkspaceLayout>(r#""Horizontal""#).unwrap(),
+            WorkspaceLayout::Horizontal
+        );
+    }
+
+    #[test]
+    fn config_without_layout_field_deserializes_with_default() {
+        let json = r#"{
+            "workspace_mode": "OutputBound",
+            "action_on_typing": "None",
+            "workspace_wraparound": true
+        }"#;
+        let config: WorkspaceConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.workspace_layout, WorkspaceLayout::Vertical);
+    }
+
+    #[test]
+    fn config_with_scrolling_deserializes() {
+        let json = r#"{
+            "workspace_mode": "Global",
+            "workspace_layout": "Scrolling",
+            "action_on_typing": "None",
+            "workspace_wraparound": false
+        }"#;
+        let config: WorkspaceConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.workspace_layout, WorkspaceLayout::Scrolling);
+    }
+
+    #[test]
+    fn layout_serializes_back_to_scrolling() {
+        let json = serde_json::to_string(&WorkspaceLayout::Scrolling).unwrap();
+        assert_eq!(json, r#""Scrolling""#);
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

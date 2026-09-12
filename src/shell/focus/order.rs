@@ -272,10 +272,10 @@ fn render_input_order_internal<R: 'static>(
                 (WorkspaceLayout::Vertical, false) => {
                     (0, (output_size.h as f32 * percentage).round() as i32)
                 }
-                (WorkspaceLayout::Horizontal, true) => {
+                (WorkspaceLayout::Horizontal, true) | (WorkspaceLayout::Scrolling, true) => {
                     ((-output_size.w as f32 * percentage).round() as i32, 0)
                 }
-                (WorkspaceLayout::Horizontal, false) => {
+                (WorkspaceLayout::Horizontal, false) | (WorkspaceLayout::Scrolling, false) => {
                     ((output_size.w as f32 * percentage).round() as i32, 0)
                 }
             });
@@ -285,8 +285,12 @@ fn render_input_order_internal<R: 'static>(
                 Point::<i32, Logical>::from(match (layout, forward) {
                     (WorkspaceLayout::Vertical, true) => (0, output_size.h + offset.y),
                     (WorkspaceLayout::Vertical, false) => (0, -(output_size.h - offset.y)),
-                    (WorkspaceLayout::Horizontal, true) => (output_size.w + offset.x, 0),
-                    (WorkspaceLayout::Horizontal, false) => (-(output_size.w - offset.x), 0),
+                    (WorkspaceLayout::Horizontal, true) | (WorkspaceLayout::Scrolling, true) => {
+                        (output_size.w + offset.x, 0)
+                    }
+                    (WorkspaceLayout::Horizontal, false) | (WorkspaceLayout::Scrolling, false) => {
+                        (-(output_size.w - offset.x), 0)
+                    }
                 }),
             )
         }
