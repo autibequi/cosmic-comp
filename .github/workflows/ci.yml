@@ -2,9 +2,9 @@ name: Continuous Integration
 
 on:
     push:
-        branches: [master]
+        branches: [master, special-workspace]
     pull_request:
-        branches: [master]
+        branches: [master, special-workspace]
 
 jobs:
     format:
