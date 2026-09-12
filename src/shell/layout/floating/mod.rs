@@ -349,6 +349,58 @@ impl FloatingLayout {
         self.map_internal(mapped, position, None, None)
     }
 
+    /// Map a special-workspace window at an explicit output rectangle:
+    /// `rectangle` fixes both position and size (the size overrides the
+    /// automatic floating heuristics, clamped to the window's minimum).
+    /// When `animate` is set the window slides in from above the top edge
+    /// of the output — the dropdown half of the special-workspace toggle.
+    /// The slide reuses the minimize/unminimize animation plumbing, so a
+    /// retoggle mid-slide simply replaces the animation and can never leave
+    /// a phantom frame behind.
+    pub fn map_special(
+        &mut self,
+        mapped: CosmicMapped,
+        rectangle: Rectangle<i32, Logical>,
+        animate: bool,
+    ) {
+        // Honor the client's minimum size even with an explicit comp-side
+        // size hint.
+        let min_size = mapped.min_size().unwrap_or((1, 1).into());
+        let mut size = rectangle.size;
+        size.w = size.w.max(min_size.w);
+        size.h = size.h.max(min_size.h);
+
+        self.map_internal(
+            mapped.clone(),
+            Some(rectangle.loc.as_local()),
+            Some(size),
+            None,
+        );
+
+        if !animate {
+            return;
+        }
+        let Some(target_geometry) = self.space.element_geometry(&mapped).map(RectExt::as_local)
+        else {
+            return;
+        };
+        let output = self.space.outputs().next().unwrap().clone();
+        let zone = layer_map_for_output(&output)
+            .non_exclusive_zone()
+            .as_local();
+        let mut previous_geometry = target_geometry;
+        // Park the slide start fully above the top edge of the output.
+        previous_geometry.loc.y = zone.loc.y - target_geometry.size.h;
+        self.animations.insert(
+            mapped,
+            Animation::Unminimize {
+                start: Instant::now(),
+                previous_geometry,
+                target_geometry,
+            },
+        );
+    }
+
     pub fn map_maximized(
         &mut self,
         mapped: CosmicMapped,

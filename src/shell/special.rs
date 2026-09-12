@@ -26,9 +26,10 @@
 
 use calloop::LoopHandle;
 use cosmic_comp_config::special::{SPECIAL_NUMBERED_SLOTS, SpecialAnchor, SpecialConfig};
+use smithay::desktop::layer_map_for_output;
 use smithay::input::Seat;
 use smithay::output::Output;
-use smithay::utils::IsAlive;
+use smithay::utils::{IsAlive, Logical, Rectangle};
 use tracing::debug;
 
 use crate::shell::focus::FocusTarget;
@@ -43,12 +44,55 @@ use crate::wayland::protocols::toplevel_info::{
     toplevel_enter_workspace, toplevel_leave_workspace,
 };
 
+/// The four lifecycle states of one special workspace. The slide animation
+/// itself lives in the floating layout (fire-and-forget, keyed per window),
+/// so `Showing`/`Hiding` are the transient states while a toggle operation
+/// is driving windows in or out; `settle` resolves them once the operation
+/// is done. Retoggling mid-animation is safe in every interleaving: the
+/// layout removes or replaces the per-window animation on each map/unmap,
+/// so a canceled slide can never leave a phantom frame behind.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum SpecialVisibility {
+    #[default]
+    Hidden,
+    Showing,
+    Visible,
+    Hiding,
+}
+
+impl SpecialVisibility {
+    /// The state a toggle enters from the current one. Toggling mid-slide
+    /// reverses course (`Showing -> Hiding`, `Hiding -> Showing`) instead of
+    /// getting stuck in a terminal state.
+    fn toggle(self) -> Self {
+        match self {
+            Self::Hidden | Self::Hiding => Self::Showing,
+            Self::Showing | Self::Visible => Self::Hiding,
+        }
+    }
+
+    /// Resolve the transient states once the toggle operation finished
+    /// driving its windows: the animation keeps running in the layout, but
+    /// the store's bookkeeping is terminal again.
+    fn settle(self) -> Self {
+        match self {
+            Self::Showing => Self::Visible,
+            Self::Hiding => Self::Hidden,
+            other => other,
+        }
+    }
+
+    fn is_shown(self) -> bool {
+        matches!(self, Self::Showing | Self::Visible)
+    }
+}
+
 /// Pure bookkeeping of one special workspace, generic over the window type so
 /// the policy can be unit tested without a compositor backend.
 #[derive(Debug)]
 struct SpecialStore<T> {
     entries: Vec<T>,
-    shown: bool,
+    visibility: SpecialVisibility,
     /// Window keyboard focus should return to when the special is shown
     /// again; stale values fall back to the oldest entry.
     last_focused: Option<T>,
@@ -58,7 +102,7 @@ impl<T> Default for SpecialStore<T> {
     fn default() -> Self {
         Self {
             entries: Vec::new(),
-            shown: false,
+            visibility: SpecialVisibility::default(),
             last_focused: None,
         }
     }
@@ -132,11 +176,20 @@ impl<T> SpecialStore<T> {
     }
 
     fn shown(&self) -> bool {
-        self.shown
+        self.visibility.is_shown()
     }
 
-    fn set_shown(&mut self, shown: bool) {
-        self.shown = shown;
+    /// Apply a toggle transition and report whether the special is now
+    /// being shown (as opposed to hidden).
+    fn begin_toggle(&mut self) -> bool {
+        self.visibility = self.visibility.toggle();
+        self.visibility.is_shown()
+    }
+
+    /// Resolve the transient `Showing`/`Hiding` states after the toggle
+    /// operation finished driving its windows.
+    fn settle(&mut self) {
+        self.visibility = self.visibility.settle();
     }
 
     fn is_empty(&self) -> bool {
@@ -171,12 +224,57 @@ impl PartialEq<CosmicMapped> for SpecialWindow {
 }
 
 /// Placement hint for a special slot, straight from the config. `None`
-/// sizes mean the compositor's automatic floating placement.
+/// sizes fall back to the compositor's 80%x40% dropdown footprint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpecialGeometry {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub anchor: SpecialAnchor,
+    /// Whether showing/hiding this special plays the slide animation.
+    pub animate: bool,
+}
+
+/// Fractions of the output's non-exclusive zone used when the config gives
+/// no explicit size: the Hyprland-style centered dropdown footprint.
+const FALLBACK_WIDTH_FRACTION: i32 = 4;
+const FALLBACK_WIDTH_DIVISOR: i32 = 5;
+const FALLBACK_HEIGHT_FRACTION: i32 = 2;
+const FALLBACK_HEIGHT_DIVISOR: i32 = 5;
+
+/// Pure geometry policy: resolve the on-output rectangle for a special
+/// window from its config hint and the output's non-exclusive zone.
+/// Everything is in logical pixels, so fractional output scales are handled
+/// by construction. Dimensions without a config entry fall back to the
+/// 80%x40% dropdown footprint; sizes are clamped to the zone and positions
+/// follow the configured anchor.
+fn special_rectangle(
+    geometry: SpecialGeometry,
+    zone: Rectangle<i32, Logical>,
+) -> Rectangle<i32, Logical> {
+    let fallback_w = (zone.size.w * FALLBACK_WIDTH_FRACTION / FALLBACK_WIDTH_DIVISOR).max(1);
+    let fallback_h = (zone.size.h * FALLBACK_HEIGHT_FRACTION / FALLBACK_HEIGHT_DIVISOR).max(1);
+    let width = geometry
+        .width
+        .map(|w| w as i32)
+        .unwrap_or(fallback_w)
+        .clamp(1, zone.size.w.max(1));
+    let height = geometry
+        .height
+        .map(|h| h as i32)
+        .unwrap_or(fallback_h)
+        .clamp(1, zone.size.h.max(1));
+
+    let x = match geometry.anchor {
+        SpecialAnchor::Left => zone.loc.x,
+        SpecialAnchor::Right => zone.loc.x + zone.size.w - width,
+        _ => zone.loc.x + (zone.size.w - width) / 2,
+    };
+    let y = match geometry.anchor {
+        SpecialAnchor::Top => zone.loc.y,
+        SpecialAnchor::Bottom => zone.loc.y + zone.size.h - height,
+        _ => zone.loc.y + (zone.size.h - height) / 2,
+    };
+    Rectangle::new((x, y).into(), (width, height).into())
 }
 
 #[derive(Default)]
@@ -189,10 +287,8 @@ pub struct SpecialWorkspaceManager {
     /// Named special registry; position in this vec plus the numbered
     /// offset is the slot ID (mirrors `SpecialConfig::slot_for_name`).
     named: Vec<String>,
-    /// Placement hint per slot. Written from the config; consumed by
-    /// floating-layer placement in a later iteration (the attach path still
-    /// uses automatic placement).
-    #[allow(dead_code)]
+    /// Placement hint per slot. Written from the config; consumed when a
+    /// shown special is attached to the active workspace.
     geometry: std::collections::HashMap<usize, SpecialGeometry>,
 }
 
@@ -237,6 +333,7 @@ impl SpecialWorkspaceManager {
                     width: config.numbered.width,
                     height: config.numbered.height,
                     anchor: config.numbered.anchor,
+                    animate: config.numbered.animate,
                 },
             );
         }
@@ -248,6 +345,7 @@ impl SpecialWorkspaceManager {
                         width: named.width,
                         height: named.height,
                         anchor: named.anchor,
+                        animate: named.animate,
                     },
                 );
             }
@@ -263,7 +361,6 @@ impl SpecialWorkspaceManager {
     }
 
     /// The configured placement hint for a slot, if any.
-    #[allow(dead_code)]
     pub fn geometry_for(&self, slot: usize) -> Option<SpecialGeometry> {
         self.geometry.get(&slot).copied()
     }
@@ -348,9 +445,10 @@ impl Shell {
     ) -> Option<KeyboardFocusTarget> {
         self.special.drop_dead();
         let output = seat.active_output();
-        if self.special.slot_mut(idx).shown() {
+        let showing = self.special.slot_mut(idx).begin_toggle();
+        if !showing {
             debug!(special = idx + 1, "hide special workspace");
-            self.special.slot_mut(idx).set_shown(false);
+            let geometry = self.special.geometry_for(idx);
             let attached: Vec<CosmicMapped> = self
                 .special
                 .slot_mut(idx)
@@ -359,16 +457,18 @@ impl Shell {
                 .map(|w| w.mapped.clone())
                 .collect();
             for window in attached {
-                self.special_detach_shown(&window, &output);
+                self.special_detach_shown(&window, &output, geometry);
             }
+            self.special.slot_mut(idx).settle();
             self.special_focus_candidate(seat, &output)
         } else {
-            self.special.slot_mut(idx).set_shown(true);
             if self.special.slot_mut(idx).is_empty() {
                 debug!(special = idx + 1, "show special workspace (empty)");
+                self.special.slot_mut(idx).settle();
                 return None;
             }
             debug!(special = idx + 1, "show special workspace");
+            let geometry = self.special.geometry_for(idx);
             // Focus returns to the window that had it when the special was
             // last hidden, not to an arbitrary member.
             let restore_focus = self
@@ -385,13 +485,14 @@ impl Shell {
                 .map(|w| w.mapped.clone())
                 .collect();
             for window in &detached {
-                focus = self.special_attach_to_active(window, &output);
+                focus = self.special_attach_to_active(window, &output, geometry);
             }
             for window in &detached {
                 if self.special.take_was_maximized(window) {
                     self.maximize_request(window, seat, false, loop_handle);
                 }
             }
+            self.special.slot_mut(idx).settle();
             match restore_focus {
                 Some(window) if self.special.is_attached(&window) => {
                     Some(KeyboardFocusTarget::Element(window))
@@ -453,7 +554,8 @@ impl Shell {
 
         let entry = if let Some((from, was_shown)) = self.special.holder(&window) {
             if was_shown {
-                self.special_detach_shown(&window, &output);
+                let geometry = self.special.geometry_for(from);
+                self.special_detach_shown(&window, &output, geometry);
             }
             self.special.slot_mut(from).take(&window)
         } else {
@@ -467,7 +569,8 @@ impl Shell {
         self.special.slot_mut(idx).send(entry?);
 
         if self.special.slot_mut(idx).shown() {
-            let focus = self.special_attach_to_active(&window, &output);
+            let geometry = self.special.geometry_for(idx);
+            let focus = self.special_attach_to_active(&window, &output, geometry);
             if self.special.take_was_maximized(&window) {
                 self.maximize_request(&window, seat, false, loop_handle);
             }
@@ -528,6 +631,7 @@ impl Shell {
             if !self.special.slot_mut(idx).shown() {
                 continue;
             }
+            let geometry = self.special.geometry_for(idx);
             let drifting: Vec<CosmicMapped> = self
                 .special
                 .slot_mut(idx)
@@ -536,8 +640,14 @@ impl Shell {
                 .map(|w| w.mapped.clone())
                 .collect();
             for window in drifting {
-                if self.special_detach_shown(&window, output).is_some() {
-                    self.special_attach_to_active(&window, output);
+                if self
+                    .special_detach_shown(&window, output, geometry)
+                    .is_some()
+                {
+                    // Workspace switches re-attach without the slide: the
+                    // window is already visible, moving it should not replay
+                    // the dropdown.
+                    self.special_attach_to_active(&window, output, None);
                 }
             }
         }
@@ -622,7 +732,16 @@ impl Shell {
 
     /// Detach a shown window from the workspace it is floating on. Windows
     /// stay in their special store; only the visible attachment is removed.
-    fn special_detach_shown(&mut self, window: &CosmicMapped, output: &Output) -> Option<()> {
+    /// With `Some(geometry)` the window slides back out through the top
+    /// edge of the output (the hide half of the dropdown) instead of
+    /// vanishing instantly.
+    fn special_detach_shown(
+        &mut self,
+        window: &CosmicMapped,
+        output: &Output,
+        geometry: Option<SpecialGeometry>,
+    ) -> Option<()> {
+        let animate = geometry.is_some_and(|g| g.animate);
         let handle = {
             let workspace = self
                 .workspaces
@@ -632,7 +751,21 @@ impl Shell {
                 .iter_mut()
                 .find(|ws| ws.floating_layer.mapped().any(|m| m == window))?;
             let handle = workspace.handle;
-            workspace.floating_layer.unmap(window, None);
+            // The slide target is the window's own footprint parked fully
+            // above the top edge of the output's non-exclusive zone.
+            let slide_to = animate.then(|| {
+                let zone = layer_map_for_output(workspace.output())
+                    .non_exclusive_zone()
+                    .as_local();
+                workspace
+                    .floating_layer
+                    .element_geometry(window)
+                    .map(|mut geo| {
+                        geo.loc.y = zone.loc.y - geo.size.h;
+                        geo
+                    })
+            });
+            workspace.floating_layer.unmap(window, slide_to.flatten());
             // Drop the window from every seat's focus stack so focus fixups
             // do not keep handing the keyboard back to a hidden window.
             workspace.focus_stack.remove_mapped(window);
@@ -649,15 +782,28 @@ impl Shell {
     }
 
     /// Attach a stored window as a floating window on the active workspace.
+    /// With `Some(geometry)` the window is placed (and sized) at the slot's
+    /// configured footprint and slides in from the top edge like a
+    /// dropdown; `None` keeps the automatic floating placement, unmoved.
     fn special_attach_to_active(
         &mut self,
         window: &CosmicMapped,
         output: &Output,
+        geometry: Option<SpecialGeometry>,
     ) -> Option<KeyboardFocusTarget> {
+        // The slot must be resolved before the workspace borrow: the
+        // geometry hint comes out of the special store.
         let handle = {
             let workspace = self.active_space_mut(output)?;
-            // Geometry placement (dropdown size/anchor) is a later iteration.
-            workspace.floating_layer.map(window.clone(), None);
+            if let Some(geometry) = geometry {
+                let zone = layer_map_for_output(workspace.output()).non_exclusive_zone();
+                let rect = special_rectangle(geometry, zone);
+                workspace
+                    .floating_layer
+                    .map_special(window.clone(), rect, geometry.animate);
+            } else {
+                workspace.floating_layer.map(window.clone(), None);
+            }
             workspace.handle
         };
         for (toplevel, _) in window.windows() {
@@ -724,11 +870,28 @@ fn mru_focus_excluding<'a, T>(
 
 #[cfg(test)]
 mod tests {
-    use super::{SpecialGeometry, SpecialStore, SpecialWorkspaceManager, mru_focus_excluding};
+    use super::{
+        SpecialGeometry, SpecialStore, SpecialVisibility, SpecialWorkspaceManager,
+        mru_focus_excluding, special_rectangle,
+    };
     use cosmic_comp_config::special::{
         NumberedSpecialsConfig, SPECIAL_NUMBERED_SLOTS, SpecialAnchor, SpecialConfig,
     };
+    use smithay::utils::{Logical, Rectangle, Size};
     use std::collections::BTreeMap;
+
+    fn geometry(width: Option<u32>, height: Option<u32>, anchor: SpecialAnchor) -> SpecialGeometry {
+        SpecialGeometry {
+            width,
+            height,
+            anchor,
+            animate: true,
+        }
+    }
+
+    fn zone() -> Rectangle<i32, Logical> {
+        Rectangle::new((0, 0).into(), (1920, 1080).into())
+    }
 
     /// Manager built from an absent/default `[special]` section: no named
     /// slots, default geometry — the built-in numbered behavior, unchanged.
@@ -739,11 +902,7 @@ mod tests {
         assert_eq!(manager.slot_for_name("anything"), None);
         assert_eq!(
             manager.geometry_for(0),
-            Some(SpecialGeometry {
-                width: None,
-                height: None,
-                anchor: SpecialAnchor::Center,
-            })
+            Some(geometry(None, None, SpecialAnchor::Center))
         );
     }
 
@@ -765,11 +924,14 @@ mod tests {
 
     #[test]
     fn named_geometry_is_independent_from_numbered_geometry() {
-        let mut config = SpecialConfig::default();
-        config.numbered = NumberedSpecialsConfig {
-            width: Some(800),
-            height: None,
-            anchor: SpecialAnchor::Top,
+        let mut config = SpecialConfig {
+            numbered: NumberedSpecialsConfig {
+                width: Some(800),
+                height: None,
+                anchor: SpecialAnchor::Top,
+                animate: false,
+            },
+            ..Default::default()
         };
         config.named.insert(
             "terminal".to_string(),
@@ -778,6 +940,7 @@ mod tests {
                 height: Some(400),
                 anchor: SpecialAnchor::Bottom,
                 on_demand: true,
+                animate: true,
             },
         );
         let manager = SpecialWorkspaceManager::from_config(&config);
@@ -787,15 +950,12 @@ mod tests {
                 width: Some(800),
                 height: None,
                 anchor: SpecialAnchor::Top,
+                animate: false,
             })
         );
         assert_eq!(
             manager.geometry_for(SPECIAL_NUMBERED_SLOTS),
-            Some(SpecialGeometry {
-                width: Some(1000),
-                height: Some(400),
-                anchor: SpecialAnchor::Bottom,
-            })
+            Some(geometry(Some(1000), Some(400), SpecialAnchor::Bottom))
         );
     }
 
@@ -825,15 +985,49 @@ mod tests {
     fn toggle_hidden_special_makes_it_visible() {
         let mut store = SpecialStore::<char>::default();
         assert!(!store.shown());
-        store.set_shown(true);
+        assert!(store.begin_toggle());
+        store.settle();
         assert!(store.shown());
     }
 
     #[test]
     fn toggle_visible_special_hides_it() {
         let mut store = SpecialStore::<char>::default();
-        store.set_shown(true);
-        store.set_shown(false);
+        store.begin_toggle();
+        store.settle();
+        assert!(!store.begin_toggle());
+        store.settle();
+        assert!(!store.shown());
+    }
+
+    /// The state machine must be total: any toggle from any state yields a
+    /// coherent next state, and settling resolves the transient ones. This
+    /// is what keeps a mid-animation retoggle from wedging the slot in a
+    /// half-shown bookkeeping state.
+    #[test]
+    fn visibility_toggles_are_total_and_settle() {
+        // Showing resolves to Visible.
+        let mut store = SpecialStore::<char>::default();
+        assert!(store.begin_toggle());
+        assert!(store.shown());
+        store.settle();
+        assert!(store.shown());
+        // Retoggle mid-slide would go Showing -> Hiding; from the settled
+        // Visible it goes Hiding all the same.
+        assert!(!store.begin_toggle());
+        assert!(!store.shown());
+        store.settle();
+        assert!(!store.shown());
+        // Toggling again shows it once more.
+        assert!(store.begin_toggle());
+        store.settle();
+        assert!(store.shown());
+    }
+
+    #[test]
+    fn settle_without_toggle_is_a_no_op() {
+        let mut store = SpecialStore::<char>::default();
+        store.settle();
         assert!(!store.shown());
     }
 
@@ -841,8 +1035,10 @@ mod tests {
     fn hidden_special_retains_windows() {
         let mut store = SpecialStore::<char>::default();
         store.send('a');
-        store.set_shown(true);
-        store.set_shown(false);
+        store.begin_toggle();
+        store.settle();
+        store.begin_toggle();
+        store.settle();
         assert!(store.contains(&'a'));
     }
 
@@ -867,8 +1063,10 @@ mod tests {
     #[test]
     fn showing_an_empty_special_is_a_no_op() {
         let mut store = SpecialStore::<char>::default();
-        store.set_shown(true);
+        store.begin_toggle();
+        store.settle();
         assert!(store.is_empty());
+        assert!(store.shown());
     }
 
     #[test]
@@ -886,7 +1084,8 @@ mod tests {
         let mut first = SpecialStore::<char>::default();
         let second = SpecialStore::<char>::default();
         first.send('a');
-        first.set_shown(true);
+        first.begin_toggle();
+        first.settle();
         assert!(first.shown());
         assert!(!second.shown());
         assert!(!second.contains(&'a'));
@@ -948,5 +1147,82 @@ mod tests {
         let mru = ['x', 'y'];
         let picked = mru_focus_excluding(mru.iter(), |_| false);
         assert_eq!(picked, Some(&'x'));
+    }
+
+    /// The configured 80%x40% dropdown footprint fallback, centered.
+    #[test]
+    fn geometry_without_size_falls_back_to_centered_dropdown_footprint() {
+        let rect = special_rectangle(geometry(None, None, SpecialAnchor::Center), zone());
+        assert_eq!(rect, Rectangle::new((192, 324).into(), (1536, 432).into()));
+    }
+
+    /// An explicit config size wins over the fallback.
+    #[test]
+    fn geometry_uses_configured_size() {
+        let rect = special_rectangle(
+            geometry(Some(1000), Some(400), SpecialAnchor::Center),
+            zone(),
+        );
+        assert_eq!(rect, Rectangle::new((460, 340).into(), (1000, 400).into()));
+    }
+
+    /// Unset dimensions individually fall back to the footprint fraction.
+    #[test]
+    fn geometry_falls_back_per_dimension() {
+        let rect = special_rectangle(geometry(Some(800), None, SpecialAnchor::Center), zone());
+        assert_eq!(rect.size, Size::from((800, 432)));
+        let rect = special_rectangle(geometry(None, Some(200), SpecialAnchor::Center), zone());
+        assert_eq!(rect.size, Size::from((1536, 200)));
+    }
+
+    #[test]
+    fn geometry_anchors_to_each_edge() {
+        let top = special_rectangle(geometry(None, None, SpecialAnchor::Top), zone());
+        assert_eq!(top.loc, (192, 0).into());
+        let bottom = special_rectangle(geometry(None, None, SpecialAnchor::Bottom), zone());
+        assert_eq!(bottom.loc, (192, 648).into());
+        let left = special_rectangle(geometry(None, None, SpecialAnchor::Left), zone());
+        assert_eq!(left.loc, (0, 324).into());
+        let right = special_rectangle(geometry(None, None, SpecialAnchor::Right), zone());
+        assert_eq!(right.loc, (384, 324).into());
+        let center = special_rectangle(geometry(None, None, SpecialAnchor::Center), zone());
+        assert_eq!(center.loc, (192, 324).into());
+    }
+
+    /// A non-empty zone offset (panels reserve space) shifts the anchor
+    /// accordingly: everything is computed relative to the zone.
+    #[test]
+    fn geometry_is_relative_to_the_non_exclusive_zone() {
+        let zone = Rectangle::new((64, 32).into(), (1000, 800).into());
+        let rect = special_rectangle(geometry(Some(500), Some(200), SpecialAnchor::Top), zone);
+        assert_eq!(rect, Rectangle::new((314, 32).into(), (500, 200).into()));
+    }
+
+    /// Configured sizes larger than the output are clamped so a typo in the
+    /// config can never push the dropdown off-screen.
+    #[test]
+    fn geometry_clamps_to_the_zone() {
+        let rect = special_rectangle(
+            geometry(Some(99999), Some(99999), SpecialAnchor::Bottom),
+            zone(),
+        );
+        assert_eq!(rect, Rectangle::new((0, 0).into(), (1920, 1080).into()));
+    }
+
+    /// SpecialVisibility is exercised through `SpecialStore` above; this
+    /// pins the raw transition table so the enum cannot drift silently.
+    #[test]
+    fn visibility_transition_table() {
+        use SpecialVisibility::*;
+        assert_eq!(Hidden.toggle(), Showing);
+        assert_eq!(Hiding.toggle(), Showing);
+        assert_eq!(Visible.toggle(), Hiding);
+        assert_eq!(Showing.toggle(), Hiding);
+        assert_eq!(Showing.settle(), Visible);
+        assert_eq!(Hiding.settle(), Hidden);
+        assert_eq!(Hidden.settle(), Hidden);
+        assert_eq!(Visible.settle(), Visible);
+        assert!(Showing.is_shown() && Visible.is_shown());
+        assert!(!Hidden.is_shown() && !Hiding.is_shown());
     }
 }

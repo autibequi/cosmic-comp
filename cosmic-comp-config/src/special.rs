@@ -37,9 +37,13 @@ pub enum SpecialAnchor {
     Right,
 }
 
-/// Geometry shared by the numbered specials. `None` sizes keep the
-/// compositor's automatic floating placement.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+fn default_true() -> bool {
+    true
+}
+
+/// Geometry shared by the numbered specials. `None` sizes fall back to the
+/// compositor's 80%x40% centered dropdown footprint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NumberedSpecialsConfig {
     #[serde(default)]
     pub width: Option<u32>,
@@ -47,10 +51,25 @@ pub struct NumberedSpecialsConfig {
     pub height: Option<u32>,
     #[serde(default)]
     pub anchor: SpecialAnchor,
+    /// Whether showing/hiding this special slides the window in and out.
+    /// Disable for an instant, animation-free toggle.
+    #[serde(default = "default_true")]
+    pub animate: bool,
+}
+
+impl Default for NumberedSpecialsConfig {
+    fn default() -> Self {
+        Self {
+            width: None,
+            height: None,
+            anchor: SpecialAnchor::default(),
+            animate: true,
+        }
+    }
 }
 
 /// One named special workspace.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NamedSpecialConfig {
     #[serde(default)]
     pub width: Option<u32>,
@@ -63,6 +82,22 @@ pub struct NamedSpecialConfig {
     /// by the compositor yet.
     #[serde(default)]
     pub on_demand: bool,
+    /// Whether showing/hiding this special slides the window in and out.
+    /// Disable for an instant, animation-free toggle.
+    #[serde(default = "default_true")]
+    pub animate: bool,
+}
+
+impl Default for NamedSpecialConfig {
+    fn default() -> Self {
+        Self {
+            width: None,
+            height: None,
+            anchor: SpecialAnchor::default(),
+            on_demand: false,
+            animate: true,
+        }
+    }
 }
 
 /// The `[special]` section. Every field defaults, so a config without this
@@ -165,12 +200,14 @@ mod tests {
         assert_eq!(config.numbered.width, Some(800));
         assert_eq!(config.numbered.height, Some(600));
         assert_eq!(config.numbered.anchor, SpecialAnchor::Top);
+        assert!(config.numbered.animate);
 
         let terminal = &config.named["terminal"];
         assert_eq!(terminal.width, Some(1000));
         assert_eq!(terminal.height, Some(400));
         assert_eq!(terminal.anchor, SpecialAnchor::Top);
         assert!(terminal.on_demand);
+        assert!(terminal.animate);
 
         let notes = &config.named["notes"];
         // Unset optional fields fall back to defaults.
@@ -190,6 +227,7 @@ mod tests {
                 height: Some(400),
                 anchor: SpecialAnchor::Top,
                 on_demand: true,
+                animate: false,
             },
         );
         let config = SpecialConfig {
@@ -197,6 +235,7 @@ mod tests {
                 width: Some(800),
                 height: None,
                 anchor: SpecialAnchor::Center,
+                animate: true,
             },
             named,
         };
